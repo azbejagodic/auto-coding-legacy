@@ -17,7 +17,6 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    configure_logging()
     args = build_parser().parse_args(argv)
     if args.command == "doctor":
         results = run_doctor()
@@ -25,6 +24,7 @@ def main(argv: list[str] | None = None) -> int:
             print(result.format())
         return 0 if all(result.available for result in results) else 1
 
+    configure_logging()
     build_parser().print_help()
     return 0
 

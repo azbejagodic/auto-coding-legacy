@@ -18,7 +18,7 @@ From the repository directory:
 py -3.12 -m venv .venv
 .\.venv\Scripts\Activate.ps1
 python -m pip install --upgrade pip
-python -m pip install --editable .
+python -m pip install --editable ".[test]"
 Copy-Item config.example.toml config.toml
 ```
 
@@ -39,5 +39,7 @@ Run tests:
 ```powershell
 python -m pytest
 ```
+
+The optional `test` dependency installs pytest for running the test suite.
 
 Application logs are written to `logs\auto-coding.log` when the application configures logging.
