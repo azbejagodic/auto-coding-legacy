@@ -48,6 +48,13 @@ secrets/
 # Browser profiles and automation state
 browser-profile/
 browser_profiles/
+browser-profiles/
+chatgpt-profile/
+playwright-browsers/
+.auto-coding-operation.json
+storage-state*.json
+*.har
+*.trace.zip
 playwright/.auth/
 playwright-report/
 test-results/

@@ -11,3 +11,13 @@ workspace = "."
 [storage]
 database_path = "runtime/tasks.sqlite3"
 
+[browser]
+# Documentation only: pass these options to ChatGPTTransport explicitly.
+headless = false
+navigation_timeout = 30.0
+response_timeout = 120.0
+# Omit profile_directory to use the OS-local application-data default.
+# A custom dedicated directory must be outside ALL Git repositories.
+# Never use an ordinary Chrome/Edge profile or put credentials here.
+# channel = "msedge"  # Optional installed browser; default is bundled Chromium.
+

@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+<head><meta charset="utf-8"><title>Offline conversation fixture</title>
+<style>[data-message-author-role] { white-space: pre-wrap; }</style>
+</head>
+<body>
+<button data-testid="accounts-profile-button">Account</button>
+<button data-testid="temporary-chat-button" aria-pressed="false">Temporary</button>
+<main>
+  <article><div data-message-id="old-user" data-message-author-role="user">Earlier question</div></article>
+  <article><div data-message-id="old-answer" data-message-author-role="assistant">Earlier answer, never return me</div>
+    <button data-testid="copy-turn-action-button">Copy</button></article>
+  <textarea id="prompt-textarea"></textarea>
+  <button data-testid="send-button">Send</button>
+</main>
+<script>
+window.submitCount = 0;
+window.turnNumber = 0;
+window.appendMessage = (role, id, text) => {
+    const article = document.createElement('article');
+    const content = document.createElement('div');
+    content.dataset.messageId = id;
+    content.dataset.messageAuthorRole = role;
+    content.textContent = text;
+    article.append(content);
+    document.querySelector('main').append(article);
+    return article;
+};
+window.finish = ({copy = true, clearBusy = true, text = 'Full response\nSecond line 🐍'} = {}) => {
+    const article = window.activeAnswer;
+    article.querySelector('[data-message-id]').textContent = text;
+    if (clearBusy) article.removeAttribute('data-is-streaming');
+    document.querySelector('[data-testid="stop-button"]')?.remove();
+    if (copy) {
+        const button = document.createElement('button');
+        button.dataset.testid = 'copy-turn-action-button';
+        button.textContent = 'Copy';
+        article.append(button);
+    }
+};
+document.querySelector('[data-testid="send-button"]').onclick = () => {
+    window.submitCount++;
+    window.turnNumber++;
+    const composer = document.querySelector('#prompt-textarea');
+    window.appendMessage('user', 'new-user-' + window.turnNumber, composer.value);
+    window.activeAnswer = window.appendMessage('assistant', 'new-answer-' + window.turnNumber, 'Partial');
+    window.activeAnswer.dataset.isStreaming = 'true';
+    composer.value = '';
+    const stop = document.createElement('button');
+    stop.dataset.testid = 'stop-button';
+    stop.textContent = 'Stop';
+    document.querySelector('main').append(stop);
+};
+</script>
+</body>
+</html>
