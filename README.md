@@ -1,6 +1,6 @@
 # auto-coding
 
-Local auto-coding foundation with read-only diagnostics, logging, SQLite storage, Codex execution, approved tests, a locked single-task commit/push controller, and a standalone ChatGPT browser transport. Browser reviews, automatic multi-task scheduling, pull requests, and the dashboard are intentionally not implemented yet.
+Local auto-coding foundation with read-only diagnostics, logging, SQLite task storage, Codex CLI execution, approved tests, and a locked single-task commit/push controller. Automated AI communication for task preparation and commit reviews is not yet connected; a supported CLI integration will be implemented in a separate task. Gemini CLI is being evaluated but is not implemented. Automatic multi-task scheduling, pull requests, and the dashboard are intentionally not implemented yet.
 
 ## Requirements
 
@@ -42,21 +42,10 @@ python -m pytest
 
 The optional `test` dependency installs pytest for running the test suite.
 
-The browser transport also needs a Playwright browser binary (one-time download):
-
-```powershell
-python -m playwright install chromium
-```
-
-No administrator rights are needed. Automated browser tests fulfill every page
-request locally and never sign in or send ChatGPT messages. DOM tests skip with
-an explanation if Chromium is not installed; install it to run the complete
-browser coverage. Mock transport tests always run. See
-[browser transport setup, API, and optional manual smoke test](docs/browser-transport.md).
-
 On Windows venv installations that use a launcher/worker redirector, an existing
 direct-process lock-termination test needs the base-interpreter command documented
-in that guide. No application lock checks or test assertions are disabled.
+in [known issues](docs/known-issues.md#existing-lock-termination-test-with-windows-venv-redirectors).
+No application lock checks or test assertions are disabled.
 
 Application logs are written to `logs\auto-coding.log` when the application configures logging.
 
@@ -332,7 +321,7 @@ succeed, `ready_to_commit` is an intermediate persistence point. The controller
 discovers approved additions/modifications/tracked deletions, creates one commit
 named `<task ID>: <title>`, saves its SHA/branch, then pushes that exact SHA and
 verifies the remote branch. Only verified push metadata saved atomically with
-status permits `awaiting_review`. This is not review approval; no browser review,
+status permits `awaiting_review`. This is not review approval; no AI review,
 next task, pull request, merge, branch creation, or retry is performed.
 
 Failures after claiming attempt `running → failed`. If persistence fails, the

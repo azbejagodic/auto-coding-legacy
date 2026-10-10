@@ -45,7 +45,8 @@ config.toml
 credentials/
 secrets/
 
-# Browser profiles and automation state
+# Retained security exclusions for local profiles, credentials, and captures.
+# These protect existing private data even without a browser integration.
 browser-profile/
 browser_profiles/
 browser-profiles/
