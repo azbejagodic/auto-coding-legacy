@@ -4,7 +4,7 @@ from functools import partial
 import logging
 from pathlib import Path
 import sqlite3
-from threading import Barrier
+from threading import Barrier, Event
 from unittest.mock import Mock
 
 import pytest
@@ -12,7 +12,7 @@ import pytest
 from auto_coding.controller import SingleTaskController
 from auto_coding.integrations.codex import CodexResult
 from auto_coding.integrations.git import GitRepository, GitResult, RepositoryState
-from auto_coding.storage import TaskStatus, TaskStore
+from auto_coding.storage import PushState, TaskStatus, TaskStore
 from auto_coding.test_runner import CommandResult, TestRunResult as RunResult
 from auto_coding.workspace_lock import WorkspaceBusyError, WorkspaceLock, WorkspaceLockError
 
@@ -103,15 +103,20 @@ def test_only_queued_task_may_start(setup, status):
     setup[4].assert_not_called()
 
 
-def test_concurrent_controllers_cannot_both_execute(setup):
+@pytest.mark.parametrize("commit_visible_to_loser", [False, True])
+def test_concurrent_controllers_cannot_both_execute(setup, commit_visible_to_loser):
     path = setup[0]
     barrier = Barrier(2)
+    winner_finished = Event()
     codex, tests = setup[3:5]
 
     def worker(index):
         directory = setup[5] / str(index)
         directory.mkdir()
         with TaskStore(path) as store:
+            repository = repository_factory(directory)
+            updates = Mock(wraps=store.update_status)
+            store.update_status = updates
             original = store.get_task
             first = True
 
@@ -121,23 +126,54 @@ def test_concurrent_controllers_cannot_both_execute(setup):
                 if first:
                     first = False
                     barrier.wait(timeout=5)  # Both observed queued before either claims.
+                    if commit_visible_to_loser and index == 1:
+                        assert winner_finished.wait(timeout=5)
                 return task
 
             store.get_task = retrieve
-            return SingleTaskController(store, codex_runner=codex, test_runner=tests,
-                                        lock_factory=setup[2].lock_factory,
-                                        repository_factory=repository_factory).execute(
+            result = SingleTaskController(store, codex_runner=codex, test_runner=tests,
+                                          lock_factory=setup[2].lock_factory,
+                                          repository_factory=lambda _: repository).execute(
                 "TASK-A", directory, [["tool", "test"]],
                 expected_branch=BRANCH, allowed_files=["file.txt"],
             )
+            if index == 0:
+                winner_finished.set()
+            return result, repository, updates
 
     with ThreadPoolExecutor(max_workers=2) as pool:
-        results = list(pool.map(worker, range(2)))
-    assert sum(result.success for result in results) == 1
-    assert any("already claimed" in (result.error or "") for result in results)
+        executions = list(pool.map(worker, range(2)))
+    assert sum(result.success for result, _, _ in executions) == 1
+    winner, winning_repo, _ = next(item for item in executions if item[0].success)
+    loser, losing_repo, losing_updates = next(item for item in executions if not item[0].success)
+    claimed_error = "Task is no longer queued or another execution already claimed it"
+    committed_error = "Task already produced a commit; manual recovery/review is required"
+    # get_task and get_commit are separate reads: the winner can commit after
+    # both queued snapshots, but before the loser's commit lookup or claim.
+    assert loser.error in {claimed_error, committed_error}, loser
+    assert not loser.state_uncertain and not loser.workspace_busy
+    assert loser.codex_result is None and loser.test_result is None
+    if loser.error == committed_error:
+        assert loser.final_status == TaskStatus.QUEUED  # Its earlier read, not persisted state.
+        assert loser.commit_sha == winner.commit_sha == SHA
+        assert loser.branch == BRANCH
+    else:
+        assert loser.final_status in {TaskStatus.RUNNING, TaskStatus.READY_TO_COMMIT, TaskStatus.AWAITING_REVIEW}
+        assert loser.commit_sha is None and not loser.push_verified
+    if commit_visible_to_loser:
+        assert loser.error == committed_error and loser.push_verified
     codex.assert_called_once()
     tests.assert_called_once()
+    winning_repo.commit_files.assert_called_once()
+    winning_repo.push_branch.assert_called_once()
+    losing_repo.commit_files.assert_not_called()
+    losing_repo.push_branch.assert_not_called()
+    losing_updates.assert_not_called()
+    assert winner.error is None and not winner.state_uncertain and winner.push_verified
     assert setup[1].get_task("TASK-A").status == TaskStatus.AWAITING_REVIEW
+    saved_commit = setup[1].get_commit("TASK-A")
+    assert (saved_commit.commit_sha, saved_commit.branch, saved_commit.github_commit_url, saved_commit.push_state) == (
+        SHA, BRANCH, URL + SHA, PushState.VERIFIED)
 
 
 @pytest.mark.parametrize("timed_out", [False, True])
