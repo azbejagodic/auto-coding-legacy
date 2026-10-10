@@ -1,6 +1,6 @@
 # auto-coding
 
-Local foundation for the auto-coding development workflow, with read-only prerequisite diagnostics, logging, SQLite task storage, a single-task Codex CLI runner, explicit Git/GitHub operations, and pytest setup. Browser automation, workflow orchestration, and the dashboard are intentionally not implemented yet.
+Local foundation for the auto-coding development workflow, with read-only prerequisite diagnostics, logging, SQLite task storage, a single-task Codex CLI runner, explicit Git/GitHub operations, a language-independent test runner, and pytest setup. Browser automation, workflow orchestration, and the dashboard are intentionally not implemented yet.
 
 ## Requirements
 
@@ -153,3 +153,45 @@ before retrying. Credential-path checks cover known names, not secret detection
 inside arbitrary source files. Git configuration and credential/transport
 helpers are trusted local prerequisites. Tests use temporary local bare
 remotes or mocked results and never contact GitHub.
+
+## Approved test commands
+
+`auto_coding.test_runner.run_tests(working_directory, commands, timeout=600.0)`
+executes an ordered list of argument lists in the selected project directory:
+
+```python
+from auto_coding.test_runner import run_tests
+
+result = run_tests(".", [["python", "-m", "pytest"]], timeout=120)
+```
+
+Commands must come from trusted, preapproved configuration supplied by the
+caller. No commands are discovered from project files or Codex output. The
+runner uses `shell=False`, installs no dependencies, and does not change project
+files itself; invoked test programs may produce their usual artifacts. Argument
+lists such as `["npm", "test", "--", "--runInBand"]` and `["cargo", "test"]`
+are supported without choosing a programming language or test framework.
+
+The complete plan is validated before starting. Commands execute sequentially
+with the same configurable per-command timeout and stop on the first failure.
+Empty or invalid plans fail without launching anything. `TestRunResult`
+contains overall success, command results, executed count, failed command,
+total duration, and error details. Each `CommandResult` contains the exact
+arguments, exit code, stdout/stderr, duration, success, timeout flag, and any
+execution or cleanup error. Only exit code zero without execution errors passes.
+
+On timeout, Windows uses the system `taskkill /PID <launched-pid> /T /F` and
+POSIX uses a dedicated process group. Cleanup and output-drain waits are bounded;
+failures are reported, with a direct-child termination fallback. No administrator
+permissions are requested. Detached descendants or Windows children whose
+parent already exited may escape tree cleanup; this is reported if output pipes
+remain open or the parent has exited at timeout. Tests must not deliberately
+detach background services. No sandbox is added: approved test commands run
+with the caller's normal permissions.
+
+Logs identify the executable and argument count, timing, and status. Argument
+values, environment variables, and captured output are not logged. Returned
+arguments/output may contain private data; callers must handle them accordingly.
+Output is buffered in memory. Configure logging through the existing logging
+setup before calling the runner. No workflow, retry, Git, or database operations
+are connected to this module.
