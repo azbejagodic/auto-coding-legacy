@@ -1,6 +1,8 @@
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+from functools import partial
 import logging
+from pathlib import Path
 import sqlite3
 from threading import Barrier
 from unittest.mock import Mock
@@ -9,9 +11,30 @@ import pytest
 
 from auto_coding.controller import SingleTaskController
 from auto_coding.integrations.codex import CodexResult
+from auto_coding.integrations.git import GitRepository, GitResult, RepositoryState
 from auto_coding.storage import TaskStatus, TaskStore
 from auto_coding.test_runner import CommandResult, TestRunResult as RunResult
 from auto_coding.workspace_lock import WorkspaceBusyError, WorkspaceLock, WorkspaceLockError
+
+
+BRANCH = "feature/task"
+BASE, SHA = "a" * 40, "b" * 40
+URL = "https://github.com/example/project/commit/"
+
+
+def repository_factory(path):
+    repo = Mock(spec=GitRepository)
+    repo.path = Path(path).resolve()
+    repo.validate_execution.return_value = RepositoryState(repo.path, BRANCH, BASE, False, True)
+    repo.verify_origin.return_value = "https://github.com/example/project.git"
+    repo.current_commit_sha.return_value = BASE
+    repo.has_uncommitted_changes.return_value = False
+    repo.active_branch.return_value = BRANCH
+    repo.commit_url.side_effect = lambda sha: URL + sha
+    repo.changed_files.return_value = ["file.txt"]
+    repo.commit_files.return_value = GitResult(repo.path, BRANCH, SHA)
+    repo.push_branch.return_value = GitResult(repo.path, BRANCH, SHA, URL + SHA)
+    return repo
 
 
 @pytest.fixture
@@ -26,7 +49,9 @@ def setup(tmp_path):
         command = CommandResult(("tool", "test"), 0, "private tests", "", 0.1, True)
         tests = Mock(return_value=RunResult(True, (command,), None, 0.1))
         factory = lambda workspace: WorkspaceLock(workspace, lock_directory=tmp_path.parent / "locks")
-        controller = SingleTaskController(store, codex_runner=codex, test_runner=tests, lock_factory=factory)
+        controller = SingleTaskController(store, codex_runner=codex, test_runner=tests, lock_factory=factory,
+                                          repository_factory=repository_factory)
+        controller.execute = partial(controller.execute, expected_branch=BRANCH, allowed_files=["file.txt"])
         yield path, store, controller, codex, tests, tmp_path
 
 
@@ -44,7 +69,7 @@ def test_success_forwards_saved_prompt_model_directory_timeouts_and_persists(set
     codex.side_effect = run
     with caplog.at_level(logging.INFO):
         result = execute(setup, codex_timeout=12, test_timeout=8)
-    assert result.success and result.final_status == TaskStatus.READY_TO_COMMIT
+    assert result.success and result.final_status == TaskStatus.AWAITING_REVIEW
     assert result.model == "exact-model" and result.task_id == "TASK-A"
     assert result.error is None and not result.state_uncertain
     assert result.codex_result.final_response == "private answer"
@@ -54,7 +79,7 @@ def test_success_forwards_saved_prompt_model_directory_timeouts_and_persists(set
                                   working_directory=directory.resolve(), timeout=12)
     tests.assert_called_once_with(working_directory=directory.resolve(), commands=(("tool", "test"),), timeout=8)
     with TaskStore(path) as reopened:
-        assert reopened.get_task("TASK-A").status == TaskStatus.READY_TO_COMMIT
+        assert reopened.get_task("TASK-A").status == TaskStatus.AWAITING_REVIEW
         assert reopened.get_task("TASK-B").status == TaskStatus.QUEUED
     for secret in ("Private saved prompt", "private answer", "private output", "private tests"):
         assert secret not in caplog.text
@@ -100,8 +125,10 @@ def test_concurrent_controllers_cannot_both_execute(setup):
 
             store.get_task = retrieve
             return SingleTaskController(store, codex_runner=codex, test_runner=tests,
-                                        lock_factory=setup[2].lock_factory).execute(
+                                        lock_factory=setup[2].lock_factory,
+                                        repository_factory=repository_factory).execute(
                 "TASK-A", directory, [["tool", "test"]],
+                expected_branch=BRANCH, allowed_files=["file.txt"],
             )
 
     with ThreadPoolExecutor(max_workers=2) as pool:
@@ -110,7 +137,7 @@ def test_concurrent_controllers_cannot_both_execute(setup):
     assert any("already claimed" in (result.error or "") for result in results)
     codex.assert_called_once()
     tests.assert_called_once()
-    assert setup[1].get_task("TASK-A").status == TaskStatus.READY_TO_COMMIT
+    assert setup[1].get_task("TASK-A").status == TaskStatus.AWAITING_REVIEW
 
 
 @pytest.mark.parametrize("timed_out", [False, True])
@@ -221,8 +248,10 @@ def test_interrupted_task_stays_running_and_cannot_restart(setup):
     with TaskStore(setup[0]) as reopened:
         assert reopened.get_task("TASK-A").status == TaskStatus.RUNNING
         result = SingleTaskController(reopened, codex_runner=setup[3], test_runner=setup[4],
-                                      lock_factory=setup[2].lock_factory).execute(
+                                      lock_factory=setup[2].lock_factory,
+                                      repository_factory=repository_factory).execute(
             "TASK-A", setup[5], [["tool"]],
+            expected_branch=BRANCH, allowed_files=["file.txt"],
         )
         assert not result.success and result.final_status == TaskStatus.RUNNING
     setup[3].assert_called_once()
@@ -308,8 +337,8 @@ def test_release_failure_reports_error_without_losing_persisted_status(setup, mo
     setup[2].lock_factory = lambda workspace: lock
     result = execute(setup)
     assert not result.success and "unlock failed" in result.error
-    assert result.final_status == TaskStatus.READY_TO_COMMIT
-    assert setup[1].get_task("TASK-A").status == TaskStatus.READY_TO_COMMIT
+    assert result.final_status == TaskStatus.AWAITING_REVIEW
+    assert setup[1].get_task("TASK-A").status == TaskStatus.AWAITING_REVIEW
 
 
 @pytest.mark.parametrize("error", ["Windows containment setup failed", "Windows cleanup could not be confirmed",

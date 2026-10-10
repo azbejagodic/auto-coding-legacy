@@ -244,7 +244,7 @@ def test_github_push_result_and_explicit_refspec(repository, monkeypatch):
     result = repository.push_branch(branch, sha)
     assert result.github_commit_url == f"https://github.com/team/project/commit/{sha}"
     assert pushed == [("-c", "remote.origin.mirror=false", "push", "--no-force", "--no-follow-tags",
-                       "origin", f"refs/heads/{branch}:refs/heads/{branch}")]
+                       "origin", f"{sha}:refs/heads/{branch}")]
 
 
 def test_push_command_failure_stops_verification(repository, monkeypatch):

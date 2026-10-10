@@ -1,6 +1,6 @@
 # auto-coding
 
-Local foundation for the auto-coding development workflow, with read-only prerequisite diagnostics, logging, SQLite task storage, a Codex CLI runner, explicit Git/GitHub operations, a language-independent test runner, a single-task controller, and pytest setup. Browser automation, automatic multi-task scheduling, and the dashboard are intentionally not implemented yet.
+Local auto-coding foundation with read-only diagnostics, logging, SQLite storage, Codex execution, approved tests, and a locked single-task commit/push controller. Browser reviews, automatic multi-task scheduling, pull requests, and the dashboard are intentionally not implemented yet.
 
 ## Requirements
 
@@ -75,10 +75,21 @@ returns `None`; updating a missing task raises `KeyError`. Tasks are listed by
 `ready_to_commit`, `awaiting_review`, `approved`, `rejected`, and `failed`.
 General status updates do not impose transition rules; `claim_task(task_id)`
 atomically changes only queued tasks to running, returning whether it succeeded.
+Tasks with a saved commit cannot be claimed again, even if manually reset to queued.
 Existing foundation databases are migrated transactionally on opening to permit
 the new status while preserving their task data. Acceptance criteria are serialized as JSON, and timestamps
 are UTC ISO 8601 strings. Database files and SQLite sidecar files are ignored
 by Git. Use the context manager to close the connection, or call `close()`.
+
+An additive `task_commits` table stores one immutable SHA/branch pair per task,
+its credential-free GitHub commit URL when available, and push state. Retrieve it
+with `store.get_commit(task_id)`; missing records return `None`. Existing databases
+gain this table transactionally without changing task data or supported statuses.
+`record_commit(...)` saves the local SHA before pushing; `mark_push_attempted(...)`
+persists the URL and `push_uncertain` before network I/O. `complete_push(...)`
+atomically saves `verified` metadata and `awaiting_review`, or rolls both back.
+Only call the latter after independently verifying the remote. General-purpose
+`update_status` remains available; controller policy governs automated transitions.
 
 ## Codex CLI runner
 
@@ -168,8 +179,13 @@ or push. The interface is independent of task storage and Codex:
   `HEAD`; this stages an already-occurring deletion without deleting anything.
   Additions, modifications, and selected deletions can share one commit.
   Untracked missing files and empty commits are rejected.
+  Optional `expected_base_sha` rejects HEAD drift from the tested baseline before
+  staging. `validate_execution(expected_branch, allowed_files)` checks the clean
+  branch, repository state, approved paths, and github.com origin without mutation.
+  `changed_files(...)` discovers literal tracked/untracked changes and rejects
+  staged files, unapproved paths, HEAD/origin drift, and unsafe selections.
 - `push_branch(expected_branch, expected_commit_sha)` requires HEAD to match,
-  pushes only that branch without force, queries origin to verify its SHA,
+  pushes the exact SHA to only that branch without force, queries origin to verify its SHA,
   and returns a `GitResult`. Supported github.com HTTPS/SSH remotes also yield
   a credential-free commit URL; other remotes yield `None`.
 
@@ -236,10 +252,11 @@ are connected to this module.
 
 ## Single-task controller
 
-`SingleTaskController` connects caller-owned storage to the existing Codex and
-test runners. Calling `execute()` launches a real task and consumes Codex model
-usage; tests inject mocks instead. Explicitly choose one queued task and supply
-trusted, preapproved test commands:
+`SingleTaskController` connects caller-owned storage to Codex, tests, and Git.
+Calling `execute()` launches a real task, consumes Codex model usage and can
+commit/push to GitHub; tests use mocks and temporary local remotes. Explicitly
+choose one queued task and supply trusted, preapproved test commands, the expected
+development branch, and a literal approved-file list:
 
 ```python
 from auto_coding.controller import SingleTaskController
@@ -250,36 +267,66 @@ with TaskStore("runtime/tasks.sqlite3") as store:
     result = controller.execute(
         "TASK-EXAMPLE", ".", [["python", "-m", "pytest"]],
         codex_timeout=600, test_timeout=120,
+        expected_branch="feature/your-approved-batch",
+        allowed_files=["src/example.py", "tests/test_example.py"],
     )
 ```
 
-The task must already exist. A conditional SQLite write claims `queued → running`
-before launching Codex, so two invocations cannot both claim it. Test configuration
-is validated using the test runner's shared validator before model execution.
-Codex receives the saved prompt/model unchanged. Only successful Codex completion
-and completion of every required test allow `running → ready_to_commit`. This
-status does not imply a Git commit or code review. The controller performs no Git
-operations and never selects or executes another task.
+The task must already exist. Both new keyword arguments are required for execution;
+omitting them returns a read-only failure rather than silently executing without
+Git safety checks. Approved files come from the caller, never Codex output. They
+must be literal file paths, not directories, globs, or pathspec magic; new files
+may be approved before they exist. Changes outside this list fail the whole task,
+not just the individual file. Tests may create ignored caches/logs; these are never
+selected for commits. Known credential/session files are forbidden even if approved.
+
+The repository root, origin, expected non-main branch, unfinished operations,
+working directory and staging area are validated before locking and again under
+the lock before claiming. Preflight/busy failures leave task state unchanged.
+A conditional SQLite write claims `queued → running`, so two invocations cannot
+both claim it. Test configuration is validated before model execution, and Codex
+receives the saved prompt/model unchanged. After Codex and every required test
+succeed, `ready_to_commit` is an intermediate persistence point. The controller
+discovers approved additions/modifications/tracked deletions, creates one commit
+named `<task ID>: <title>`, saves its SHA/branch, then pushes that exact SHA and
+verifies the remote branch. Only verified push metadata saved atomically with
+status permits `awaiting_review`. This is not review approval; no browser review,
+next task, pull request, merge, branch creation, or retry is performed.
 
 Failures after claiming attempt `running → failed`. If persistence fails, the
 result explicitly reports `state_uncertain=True` and `final_status=None`. No
 automatic retry occurs. `KeyboardInterrupt` and `SystemExit` propagate; a task
-left `running` is refused on future invocations and requires manual recovery.
+left incomplete is refused on future invocations and requires manual recovery.
+Failures never reset/discard files, unstage changes, or remove existing commits.
+A failed push may have reached the remote: inspect `get_commit(task_id)` and the
+returned SHA/branch/URL before any manual recovery. Push states are `local`
+(no push attempted), `push_uncertain` (intent saved, outcome not durably verified),
+and `verified`. No automatic retry or second commit occurs. Even a manual status
+reset cannot re-execute a task with saved commit metadata.
+
+Git and SQLite cannot form a single transaction. A crash or SQLite failure between
+local commit creation and recording its SHA can leave the commit only in Git;
+ordinary error handling returns/reconstructs its SHA where possible, but a hard
+crash cannot persist recovery details. Inspect HEAD/reflog and local changes for
+incomplete tasks. If the push is verified but final SQLite persistence fails,
+the result remains unsuccessful with `push_verified=True` and uncertainty; it
+must not be treated as approval to rerun. Never manually requeue without inspection.
 
 `ExecutionResult` includes task ID, assigned model, final status, original Codex
-and test result objects, overall success, error, duration, and uncertainty flag.
+and test result objects, commit SHA, branch, GitHub URL, push verification, final
+status, overall success, error, duration, and uncertainty flag.
 Prompts, outputs, and raw exception messages are not copied into controller logs.
 Configure logging through the existing logging setup. Inject `codex_runner` and
-`test_runner` callables into the constructor for testing. Each invocation needs
+`test_runner`, and `repository_factory` callables for testing. Each invocation needs
 its own `TaskStore` connection.
 
 Before reading or claiming a task, the controller validates the workspace and
 acquires a fail-fast OS-backed file lock for its resolved absolute path. The lock
-is held through Codex, tests, and final SQLite persistence, including failure
+is held through Codex, tests, commit, push/verification, and final SQLite persistence, including failure
 updates. Contention returns `workspace_busy=True` without changing task data or
 launching either runner; model and final status are `None` because no task is read.
 Lock acquisition and release errors return unsuccessful results. A release error
-does not undo an already-persisted task status.
+does not undo an already-persisted task status or verified push.
 
 Lock files live outside the target repository: `%LOCALAPPDATA%\auto-coding\workspace-locks`
 on Windows, `~/Library/Application Support/auto-coding/workspace-locks` on macOS,

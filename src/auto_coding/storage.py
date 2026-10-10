@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from enum import StrEnum
 import json
 from pathlib import Path
+import re
 import sqlite3
 from types import TracebackType
 
@@ -23,6 +24,21 @@ class TaskStatus(StrEnum):
 
 class DuplicateTaskError(ValueError):
     """A task with the supplied ID already exists."""
+
+
+class PushState(StrEnum):
+    LOCAL = "local"
+    UNCERTAIN = "push_uncertain"
+    VERIFIED = "verified"
+
+
+@dataclass(frozen=True)
+class TaskCommit:
+    task_id: str
+    commit_sha: str
+    branch: str
+    github_commit_url: str | None
+    push_state: PushState
 
 
 @dataclass(frozen=True)
@@ -78,6 +94,7 @@ class TaskStore:
         self._connection = sqlite3.connect(path)
         self._connection.row_factory = sqlite3.Row
         try:
+            self._connection.execute("PRAGMA foreign_keys = ON")
             with self._connection:
                 # Serialize schema initialization/migration across connections.
                 self._connection.execute("BEGIN IMMEDIATE")
@@ -111,6 +128,15 @@ class TaskStore:
                         FROM tasks_legacy
                     """)
                     self._connection.execute("DROP TABLE tasks_legacy")
+                self._connection.execute("""
+                    CREATE TABLE IF NOT EXISTS task_commits (
+                        task_id TEXT PRIMARY KEY NOT NULL REFERENCES tasks(task_id),
+                        commit_sha TEXT NOT NULL,
+                        branch TEXT NOT NULL,
+                        github_commit_url TEXT,
+                        push_state TEXT NOT NULL CHECK(push_state IN ('local', 'push_uncertain', 'verified'))
+                    )
+                """)
         except Exception:
             self._connection.close()
             raise
@@ -194,7 +220,59 @@ class TaskStore:
         """
         with self._connection:
             cursor = self._connection.execute(
-                "UPDATE tasks SET status = ?, updated_at = ? WHERE task_id = ? AND status = ?",
+                """UPDATE tasks SET status = ?, updated_at = ? WHERE task_id = ? AND status = ?
+                   AND NOT EXISTS (SELECT 1 FROM task_commits WHERE task_commits.task_id = tasks.task_id)""",
                 (TaskStatus.RUNNING, _timestamp(), task_id, TaskStatus.QUEUED),
             )
         return cursor.rowcount == 1
+
+    def get_commit(self, task_id: str) -> TaskCommit | None:
+        row = self._connection.execute("SELECT * FROM task_commits WHERE task_id = ?", (task_id,)).fetchone()
+        return (TaskCommit(row["task_id"], row["commit_sha"], row["branch"], row["github_commit_url"],
+                           PushState(row["push_state"])) if row is not None else None)
+
+    def record_commit(self, task_id: str, commit_sha: str, branch: str,
+                      github_commit_url: str | None) -> None:
+        """Save the local commit before any push; never overwrite a previous commit."""
+        if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", commit_sha):
+            raise ValueError("A full commit SHA is required")
+        if not branch or branch.casefold() == "main":
+            raise ValueError("A development branch is required")
+        with self._connection:
+            self._connection.execute(
+                "INSERT INTO task_commits VALUES (?, ?, ?, ?, ?)",
+                (task_id, commit_sha, branch, github_commit_url, PushState.LOCAL),
+            )
+
+    def mark_push_attempted(self, task_id: str, github_commit_url: str | None = None) -> None:
+        """Persist uncertainty before network I/O, including crash recovery."""
+        with self._connection:
+            cursor = self._connection.execute(
+                """UPDATE task_commits SET push_state = ?, github_commit_url = COALESCE(?, github_commit_url)
+                   WHERE task_id = ? AND push_state = ?""",
+                (PushState.UNCERTAIN, github_commit_url, task_id, PushState.LOCAL),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("Task has no unpushed local commit")
+
+    def complete_push(self, task_id: str, commit_sha: str, branch: str, github_commit_url: str) -> None:
+        """Atomically persist verified metadata and awaiting_review, or neither.
+
+        The caller must independently verify the remote before calling this.
+        """
+        if not github_commit_url:
+            raise ValueError("A GitHub commit URL is required")
+        with self._connection:
+            cursor = self._connection.execute(
+                """UPDATE task_commits SET github_commit_url = ?, push_state = ?
+                   WHERE task_id = ? AND commit_sha = ? AND branch = ? AND push_state = ?""",
+                (github_commit_url, PushState.VERIFIED, task_id, commit_sha, branch, PushState.UNCERTAIN),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("Commit metadata differs from the verified push")
+            cursor = self._connection.execute(
+                "UPDATE tasks SET status = ?, updated_at = ? WHERE task_id = ? AND status = ?",
+                (TaskStatus.AWAITING_REVIEW, _timestamp(), task_id, TaskStatus.READY_TO_COMMIT),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("Task is not ready to commit")

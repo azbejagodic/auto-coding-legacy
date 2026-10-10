@@ -4,7 +4,7 @@ import sqlite3
 
 import pytest
 
-from auto_coding.storage import DuplicateTaskError, TaskStatus, TaskStore
+from auto_coding.storage import DuplicateTaskError, PushState, TaskStatus, TaskStore
 
 
 @pytest.fixture
@@ -144,3 +144,61 @@ def test_legacy_schema_migration_preserves_data(database_path, task_data):
     with TaskStore(database_path) as reopened:
         assert reopened.get_task("queued").status == TaskStatus.READY_TO_COMMIT
         assert len(reopened.list_tasks()) == 6
+
+
+def test_commit_metadata_persistence_and_atomic_verified_transition(database_path, task_data):
+    task_id, sha, branch = task_data["task_id"], "a" * 40, "feature/task"
+    url = f"https://github.com/example/project/commit/{sha}"
+    with TaskStore(database_path) as store:
+        store.add_task(**task_data)
+        assert store.get_commit(task_id) is None
+        store.update_status(task_id, TaskStatus.READY_TO_COMMIT)
+        store.record_commit(task_id, sha, branch, None)
+    with TaskStore(database_path) as store:
+        assert store.get_commit(task_id).push_state == PushState.LOCAL
+        store.mark_push_attempted(task_id)
+        assert store.get_commit(task_id).push_state == PushState.UNCERTAIN
+        store.complete_push(task_id, sha, branch, url)
+    with TaskStore(database_path) as store:
+        saved = store.get_commit(task_id)
+        assert (saved.commit_sha, saved.branch, saved.github_commit_url, saved.push_state) == (
+            sha, branch, url, PushState.VERIFIED)
+        assert store.get_task(task_id).status == TaskStatus.AWAITING_REVIEW
+        store.update_status(task_id, TaskStatus.QUEUED)  # Even a manual reset cannot cause a duplicate commit.
+        assert not store.claim_task(task_id)
+        with pytest.raises(sqlite3.IntegrityError):
+            store.record_commit(task_id, "b" * 40, branch, None)
+        assert store.get_commit(task_id) == saved
+
+
+def test_verified_metadata_rolls_back_if_status_update_fails(database_path, task_data):
+    task_id, sha = task_data["task_id"], "a" * 40
+    with TaskStore(database_path) as store:
+        store.add_task(**task_data)
+        store.update_status(task_id, TaskStatus.READY_TO_COMMIT)
+        store.record_commit(task_id, sha, "feature/task", None)
+        store.mark_push_attempted(task_id)
+        store._connection.execute("""CREATE TRIGGER reject_review BEFORE UPDATE ON tasks
+            WHEN NEW.status = 'awaiting_review' BEGIN SELECT RAISE(ABORT, 'test failure'); END""")
+        with pytest.raises(sqlite3.IntegrityError):
+            store.complete_push(task_id, sha, "feature/task", "https://github.com/example/project/commit/" + sha)
+        assert store.get_commit(task_id).push_state == PushState.UNCERTAIN
+        assert store.get_task(task_id).status == TaskStatus.READY_TO_COMMIT
+
+
+def test_commit_metadata_rejects_invalid_and_mismatched_values(database_path, task_data):
+    with TaskStore(database_path) as store:
+        store.add_task(**task_data)
+        task_id = task_data["task_id"]
+        with pytest.raises(ValueError, match="full commit SHA"):
+            store.record_commit(task_id, "abc", "feature/task", None)
+        with pytest.raises(ValueError, match="development branch"):
+            store.record_commit(task_id, "a" * 40, "main", None)
+        with pytest.raises(ValueError):
+            store.mark_push_attempted(task_id)
+        store.record_commit(task_id, "a" * 40, "feature/task", None)
+        store.mark_push_attempted(task_id)
+        with pytest.raises(ValueError, match="differs"):
+            store.complete_push(task_id, "b" * 40, "feature/task", "url")
+        assert store.get_commit(task_id).push_state == PushState.UNCERTAIN
+        assert store.get_task(task_id).status == TaskStatus.QUEUED

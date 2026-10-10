@@ -176,6 +176,9 @@ class GitRepository:
             raise GitError("branch", "Active branch is protected or differs from the expected development branch")
 
     def _check_operation_state(self) -> None:
+        root = Path(self._run("rev-parse", "--show-toplevel").stdout.strip()).resolve()
+        if root != self.path:
+            raise GitError("state", "Repository root changed; inspect local Git configuration")
         for marker in ("MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "rebase-merge", "rebase-apply", "BISECT_LOG", "sequencer"):
             path = Path(self._run("rev-parse", "--git-path", marker).stdout.strip())
             if not path.is_absolute():
@@ -208,7 +211,7 @@ class GitRepository:
         logger.info("Development branch created: branch=%r sha=%s", branch, sha)
         return GitResult(self.path, branch, sha)
 
-    def _selected_paths(self, files: Sequence[str | Path]) -> list[str]:
+    def _selected_paths(self, files: Sequence[str | Path], *, allow_missing: bool = False) -> list[str]:
         if isinstance(files, (str, bytes)) or not files:
             raise GitError("commit", "Supply a nonempty explicit list of files")
         selected = []
@@ -242,7 +245,7 @@ class GitRepository:
             file = relative.as_posix()
             if self._run("check-ignore", "--no-index", "--quiet", "--", file, allowed=(0, 1)).returncode == 0:
                 raise GitError("commit", "Ignored file selection is forbidden")
-            if not path.exists():
+            if not path.exists() and not allow_missing:
                 # The index must be clean before this method is called. Verify
                 # an exact committed file, not a directory/prefix match, gitlink,
                 # removed symlink, or an untracked missing name.
@@ -254,7 +257,46 @@ class GitRepository:
             selected.append(file)
         return list(dict.fromkeys(selected))
 
-    def commit_files(self, expected_branch: str, files: Sequence[str | Path], message: str) -> GitResult:
+    def commit_url(self, sha: str) -> str | None:
+        """Return a credential-free GitHub URL, or None for other origins."""
+        return _github_url(self.verify_origin(), self._sha(sha))
+
+    def validate_execution(self, expected_branch: str, allowed_files: Sequence[str | Path]) -> RepositoryState:
+        """Read-only preflight; repeat under the caller's workspace lock."""
+        self._expect_branch(expected_branch)
+        self._check_operation_state()
+        state = self.validate()
+        if state.has_changes:
+            raise GitError("execute", "Working directory and staging area must be clean")
+        self._selected_paths(allowed_files, allow_missing=True)
+        if self.commit_url(state.commit_sha) is None:
+            raise GitError("execute", "Automatic task execution requires a github.com origin")
+        return state
+
+    def changed_files(self, expected_branch: str, base_sha: str,
+                      allowed_files: Sequence[str | Path], expected_origin: str) -> list[str]:
+        """Discover literal changes, rejecting staged/unapproved files or Git drift."""
+        self._expect_branch(expected_branch)
+        self._check_operation_state()
+        if self.current_commit_sha() != self._sha(base_sha):
+            raise GitError("execute", "HEAD changed during task execution; manual recovery required")
+        if self.verify_origin() != expected_origin:
+            raise GitError("execute", "Origin changed during task execution")
+        if self._run("diff", "--cached", "--name-only", "--no-renames", "-z").stdout:
+            raise GitError("execute", "Unexpected staged changes; inspect the index manually")
+        approved = {os.path.normcase(path) for path in self._selected_paths(allowed_files, allow_missing=True)}
+        tracked = self._run("diff", "--name-only", "--no-renames", "-z", "HEAD", "--").stdout
+        untracked = self._run("ls-files", "--others", "--exclude-standard", "-z").stdout
+        files = list(dict.fromkeys(path for path in (tracked + untracked).split("\x00") if path))
+        if not files:
+            raise GitError("execute", "No valid changes to commit")
+        selected = self._selected_paths(files)
+        if any(os.path.normcase(path) not in approved for path in selected):
+            raise GitError("execute", "Unexpected changed files outside the approved file list")
+        return selected
+
+    def commit_files(self, expected_branch: str, files: Sequence[str | Path], message: str,
+                     *, expected_base_sha: str | None = None) -> GitResult:
         self._expect_branch(expected_branch)
         self._check_operation_state()
         if not isinstance(message, str) or not message.strip() or "\x00" in message:
@@ -263,6 +305,8 @@ class GitRepository:
             raise GitError("commit", "Index already contains staged changes; inspect it manually")
         selected = self._selected_paths(files)
         before = self.current_commit_sha()
+        if expected_base_sha is not None and before != self._sha(expected_base_sha):
+            raise GitError("commit", "HEAD differs from the tested task baseline")
         self._run("add", "--no-ignore-removal", "--", *selected)
         staged = set(self._run("diff", "--cached", "--name-only", "-z").stdout.strip("\x00").split("\x00")) - {""}
         if not staged:
@@ -290,7 +334,7 @@ class GitRepository:
         # Explicit refspec prevents push.default and configured extra refspecs
         # from selecting other branches. Disable inherited remote force/mirror.
         self._run("-c", "remote.origin.mirror=false", "push", "--no-force", "--no-follow-tags",
-                  "origin", f"refs/heads/{expected_branch}:refs/heads/{expected_branch}")
+                  "origin", f"{expected_commit_sha}:refs/heads/{expected_branch}")
         remote = self._run("ls-remote", "--exit-code", "--heads", "origin", f"refs/heads/{expected_branch}")
         rows = [line.split() for line in remote.stdout.splitlines()]
         if rows != [[expected_commit_sha, f"refs/heads/{expected_branch}"]]:
