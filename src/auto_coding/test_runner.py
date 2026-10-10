@@ -8,9 +8,12 @@ import math
 import os
 from pathlib import Path
 import signal
+import shutil
 import subprocess
 import time
 from typing import Sequence
+
+from .integrations.windows_process import ProcessSafetyError, run_contained
 
 
 logger = logging.getLogger(__name__)
@@ -51,36 +54,14 @@ def _text(value: str | bytes | None) -> str:
 
 
 def _cleanup(process: subprocess.Popen[str]) -> str | None:
-    """Kill only the launched tree/group and reap the direct process."""
+    """Non-Windows cleanup: kill only the launched group and reap its root."""
     errors = []
-    if _WINDOWS:
-        # Retain Popen's process handle while targeting its PID. Never use
-        # image-name matching, which could terminate unrelated test processes.
-        if process.poll() is None:
-            system_root = os.environ.get("SystemRoot")
-            if not system_root:
-                errors.append("SystemRoot is unavailable; Windows tree cleanup could not run")
-            else:
-                try:
-                    killed = subprocess.run(
-                        [str(Path(system_root) / "System32" / "taskkill.exe"),
-                         "/PID", str(process.pid), "/T", "/F"],
-                        capture_output=True, text=True, encoding="utf-8", errors="replace",
-                        timeout=_CLEANUP_TIMEOUT, check=False, shell=False,
-                    )
-                    if killed.returncode != 0:
-                        errors.append(f"Windows tree cleanup failed (exit code {killed.returncode})")
-                except (OSError, subprocess.TimeoutExpired):
-                    errors.append("Windows tree cleanup could not complete")
-        else:
-            errors.append("Parent already exited; Windows descendants cannot be safely identified")
-    else:
-        try:
-            os.killpg(process.pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        except OSError:
-            errors.append("Process group cleanup failed")
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    except OSError:
+        errors.append("Process group cleanup failed")
     # Direct-child fallback is safe even if tree cleanup failed.
     try:
         if process.poll() is None:
@@ -100,30 +81,50 @@ def _execute(arguments: tuple[str, ...], directory: Path, timeout: float) -> Com
     error = cleanup_error = None
     timed_out = False
     process = None
-    options = {"creationflags": subprocess.CREATE_NEW_PROCESS_GROUP} if _WINDOWS else {"start_new_session": True}
     try:
-        process = subprocess.Popen(
-            list(arguments), cwd=directory, stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
-            encoding="utf-8", errors="replace", shell=False, **options,
-        )
-        try:
-            stdout, stderr = process.communicate(timeout=timeout)
-        except subprocess.TimeoutExpired as exc:
-            timed_out = True
-            error = "Test command timed out"
-            stdout, stderr = _text(exc.stdout), _text(exc.stderr)
-            cleanup_error = _cleanup(process)
+        if _WINDOWS:
+            executable = shutil.which(arguments[0])
+            if executable is None:
+                raise FileNotFoundError
+            completed = run_contained(
+                [executable, *arguments[1:]], input="", cwd=directory, timeout=timeout,
+                wait_for_root_exit=True,
+            )
+            stdout, stderr, exit_code = completed.stdout, completed.stderr, completed.returncode
+        else:
+            process = subprocess.Popen(
+                list(arguments), cwd=directory, stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                encoding="utf-8", errors="replace", shell=False, start_new_session=True,
+            )
             try:
-                # Bounded even if an escaped descendant retains the pipes.
-                stdout, stderr = process.communicate(timeout=_CLEANUP_TIMEOUT)
-            except subprocess.TimeoutExpired as remaining:
-                stdout = _text(remaining.stdout) or stdout
-                stderr = _text(remaining.stderr) or stderr
-                cleanup_error = "; ".join(filter(None, [cleanup_error, "Output pipes remained open after cleanup"]))
-        exit_code = process.returncode
+                stdout, stderr = process.communicate(timeout=timeout)
+            except subprocess.TimeoutExpired as exc:
+                timed_out = True
+                error = "Test command timed out"
+                stdout, stderr = _text(exc.stdout), _text(exc.stderr)
+                cleanup_error = _cleanup(process)
+                try:
+                    # Bounded even if an escaped descendant retains the pipes.
+                    stdout, stderr = process.communicate(timeout=_CLEANUP_TIMEOUT)
+                except subprocess.TimeoutExpired as remaining:
+                    stdout = _text(remaining.stdout) or stdout
+                    stderr = _text(remaining.stderr) or stderr
+                    cleanup_error = "; ".join(filter(None, [cleanup_error, "Output pipes remained open after cleanup"]))
+            exit_code = process.returncode
         if error is None and exit_code != 0:
             error = f"Test command exited with code {exit_code}"
+    except ProcessSafetyError as exc:
+        error = f"Test process containment/cleanup failed: {exc}"
+        cleanup_error = exc.cleanup_error
+        stdout, stderr, exit_code = _text(exc.stdout), _text(exc.stderr), exc.exit_code
+        timed_out = exc.timed_out
+    except subprocess.TimeoutExpired as exc:
+        # Windows backend raises only after contained-tree cleanup completes.
+        timed_out = True
+        error = "Test command timed out"
+        stdout, stderr = _text(exc.stdout), _text(exc.stderr)
+        exit_code = getattr(exc, "exit_code", None)
     except FileNotFoundError:
         error = "Test executable was not found"
     except OSError as exc:

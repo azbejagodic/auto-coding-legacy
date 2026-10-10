@@ -1,5 +1,4 @@
 import logging
-from pathlib import Path
 import signal
 import subprocess
 import sys
@@ -12,6 +11,8 @@ from auto_coding import test_runner as runner
 
 @pytest.fixture
 def popen(monkeypatch):
+    # Exercise the unchanged non-Windows backend independently of the host OS.
+    monkeypatch.setattr(runner, "_WINDOWS", False)
     process = Mock(pid=12345, returncode=0)
     process.communicate.return_value = ("captured stdout ž", "captured stderr")
     process.poll.return_value = 0
@@ -97,10 +98,7 @@ def test_invalid_timeout(tmp_path, popen, timeout):
     popen.assert_not_called()
 
 
-@pytest.mark.parametrize("windows", [True, False])
-def test_platform_invocation_is_shell_free(tmp_path, popen, monkeypatch, windows):
-    monkeypatch.setattr(runner, "_WINDOWS", windows)
-    monkeypatch.setattr(runner.subprocess, "CREATE_NEW_PROCESS_GROUP", 512, raising=False)
+def test_posix_invocation_is_shell_free(tmp_path, popen):
     args = ["tool", "a b", "$(literal)", "quotes\"; &"]
     assert runner.run_tests(tmp_path, [args]).success
     options = popen.call_args.kwargs
@@ -109,12 +107,8 @@ def test_platform_invocation_is_shell_free(tmp_path, popen, monkeypatch, windows
     assert options["cwd"] == tmp_path.resolve()
     assert options["stdin"] == subprocess.DEVNULL
     assert options["stdout"] == options["stderr"] == subprocess.PIPE
-    if windows:
-        assert options["creationflags"] == 512
-        assert "start_new_session" not in options
-    else:
-        assert options["start_new_session"] is True
-        assert "creationflags" not in options
+    assert options["start_new_session"] is True
+    assert "creationflags" not in options
 
 
 def test_timeout_kills_and_captures_output(tmp_path, popen, monkeypatch):
@@ -149,33 +143,62 @@ def test_cleanup_failure_and_unclosed_pipes_are_explicit(tmp_path, popen, monkey
     assert result.failed_command.stderr == "partial stderr"
 
 
-@pytest.mark.parametrize("tree_exit", [0, 1])
-def test_windows_cleanup_targets_only_launched_pid(monkeypatch, tree_exit):
+@pytest.fixture
+def contained(monkeypatch):
     monkeypatch.setattr(runner, "_WINDOWS", True)
-    monkeypatch.setenv("SystemRoot", "C:/Windows")
-    process = Mock(pid=12345)
-    process.poll.side_effect = [None, None]
-    taskkill = Mock(return_value=subprocess.CompletedProcess([], tree_exit, "private", "private"))
-    monkeypatch.setattr(runner.subprocess, "run", taskkill)
-    error = runner._cleanup(process)
-    assert bool(error) == (tree_exit != 0)
-    args = taskkill.call_args.args[0]
-    assert Path(args[0]).name == "taskkill.exe"
-    assert args[1:] == ["/PID", "12345", "/T", "/F"]
-    assert taskkill.call_args.kwargs["shell"] is False
-    process.kill.assert_called_once()
-    process.wait.assert_called_once_with(timeout=runner._CLEANUP_TIMEOUT)
+    monkeypatch.setattr(runner.shutil, "which", lambda executable: "C:/tools/" + executable + ".exe")
+    backend = Mock(return_value=subprocess.CompletedProcess([], 0, "out", "err"))
+    monkeypatch.setattr(runner, "run_contained", backend)
+    return backend
 
 
-def test_windows_exited_parent_does_not_target_unrelated_processes(monkeypatch):
-    monkeypatch.setattr(runner, "_WINDOWS", True)
-    process = Mock(pid=12345)
-    process.poll.return_value = 0
-    taskkill = Mock()
-    monkeypatch.setattr(runner.subprocess, "run", taskkill)
-    assert "cannot be safely identified" in runner._cleanup(process)
-    taskkill.assert_not_called()
-    process.kill.assert_not_called()
+def test_windows_invocation_uses_shared_containment_and_literal_arguments(tmp_path, contained):
+    args = ["tool", "a b", "$(literal)", "quotes\"; &"]
+    result = runner.run_tests(tmp_path, [args], timeout=12)
+    assert result.success and result.commands[0].arguments == tuple(args)
+    assert result.commands[0].stdout == "out" and result.commands[0].stderr == "err"
+    contained.assert_called_once_with(["C:/tools/tool.exe", *args[1:]], input="",
+                                      cwd=tmp_path.resolve(), timeout=12, wait_for_root_exit=True)
+
+
+@pytest.mark.parametrize("cleanup", [False, True])
+def test_windows_safety_failure_blocks_next_command_even_with_zero_exit(tmp_path, contained, cleanup):
+    contained.side_effect = runner.ProcessSafetyError(
+        "verification failed", stdout="output", stderr="errors", exit_code=0,
+        cleanup_error="cleanup uncertain" if cleanup else None,
+    )
+    result = runner.run_tests(tmp_path, [["tool"], ["never-run"]])
+    assert not result.success and result.commands_executed == 1
+    assert result.failed_command.exit_code == 0
+    assert result.failed_command.stdout == "output" and result.failed_command.stderr == "errors"
+    assert "verification failed" in result.error
+    assert result.failed_command.cleanup_error == ("cleanup uncertain" if cleanup else None)
+    contained.assert_called_once()
+
+
+def test_windows_timeout_returns_captured_output_and_cleanup_exit_code(tmp_path, contained):
+    error = subprocess.TimeoutExpired(["tool"], 1, output=b"partial", stderr=b"err")
+    error.exit_code = 1
+    contained.side_effect = error
+    result = runner.run_tests(tmp_path, [["tool"]], timeout=1)
+    assert not result.success and result.failed_command.timed_out
+    assert result.failed_command.stdout == "partial" and result.failed_command.stderr == "err"
+    assert result.failed_command.exit_code == 1 and result.failed_command.cleanup_error is None
+
+
+def test_windows_timeout_with_cleanup_failure_preserves_both_errors(tmp_path, contained):
+    contained.side_effect = runner.ProcessSafetyError("Process execution timed out; cleanup failed",
+                                                     exit_code=1, timed_out=True, cleanup_error="cleanup failed")
+    result = runner.run_tests(tmp_path, [["tool"]])
+    assert not result.success and result.failed_command.timed_out
+    assert "timed out" in result.error and result.failed_command.cleanup_error == "cleanup failed"
+
+
+def test_windows_missing_executable_never_launches(tmp_path, contained, monkeypatch):
+    monkeypatch.setattr(runner.shutil, "which", lambda _: None)
+    result = runner.run_tests(tmp_path, [["missing"]])
+    assert not result.success and "not found" in result.error
+    contained.assert_not_called()
 
 
 def test_posix_cleanup_targets_new_process_group(monkeypatch):

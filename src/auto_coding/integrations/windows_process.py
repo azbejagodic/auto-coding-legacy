@@ -1,14 +1,16 @@
 """Windows-only, creation-time job containment for the Python 3.12 runner.
 
 The narrow Popen adapter retains stdlib pipe/communication/wait handling while
-using CreateProcessW's JOB_LIST attribute (not attach-after-launch). No shell,
-breakaway, elevation, or fallback to uncontained execution is supported.
+using CreateProcessW's JOB_LIST attribute (not attach-after-launch). No shell=True,
+breakaway, elevation, or fallback to uncontained execution is supported. Windows
+may interpret batch files through its command shell, as with stdlib Popen.
 """
 
 from __future__ import annotations
 
 import ctypes as C
 from ctypes import wintypes as W
+import logging
 import os
 import subprocess
 import sys
@@ -19,16 +21,19 @@ import time
 _CLEANUP_TIMEOUT = 5.0
 _HANDLE_LIST = 0x20002
 _JOB_LIST = 0x2000D
+logger = logging.getLogger(__name__)
 
 
 class ProcessSafetyError(RuntimeError):
     """Containment or cleanup failed; never a successful execution."""
 
     def __init__(self, message: str, *, stdout: str | bytes = "", stderr: str | bytes = "",
-                 timed_out: bool = False, exit_code: int | None = None) -> None:
+                 timed_out: bool = False, exit_code: int | None = None,
+                 cleanup_error: str | None = None) -> None:
         super().__init__(message)
         self.stdout, self.stderr = stdout, stderr
         self.timed_out, self.exit_code = timed_out, exit_code
+        self.cleanup_error = cleanup_error
 
 
 class _BasicLimits(C.Structure):
@@ -126,16 +131,32 @@ class _Job:
     def terminate_and_confirm(self) -> None:
         # Also terminate surviving descendants after a normally exiting root.
         _require(self.api.TerminateJobObject(self.handle, 1), "job tree termination")
-        deadline = time.monotonic() + _CLEANUP_TIMEOUT
+        self.wait_until_empty(_CLEANUP_TIMEOUT)
+
+    def wait_until_empty(self, timeout: float | None) -> BaseException | None:
+        """Confirm emptiness; emergency waits defer errors/cancellation to stay locked.
+
+        An unbounded safety wait is used only after test cleanup has failed. It
+        retains the job (and the synchronous caller's workspace lock) rather
+        than permitting known or possibly live members to outlive that lock.
+        """
+        deadline = None if timeout is None else time.monotonic() + timeout
+        interruption = None
         while True:
-            accounting = _Accounting()
-            _require(self.api.QueryInformationJobObject(self.handle, 1, C.byref(accounting),
-                                                       C.sizeof(accounting), None), "job cleanup verification")
-            if accounting.ActiveProcesses == 0:
-                return
-            if time.monotonic() >= deadline:
-                raise ProcessSafetyError("Windows job cleanup could not be confirmed before deadline")
-            time.sleep(0.01)
+            try:
+                time.sleep(0.01)
+                accounting = _Accounting()
+                _require(self.api.QueryInformationJobObject(self.handle, 1, C.byref(accounting),
+                                                           C.sizeof(accounting), None), "job cleanup verification")
+                if accounting.ActiveProcesses == 0:
+                    return interruption
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise ProcessSafetyError("Windows job cleanup could not be confirmed before deadline")
+            except (Exception, KeyboardInterrupt, SystemExit) as exc:
+                if timeout is not None:
+                    raise
+                if not isinstance(exc, Exception):
+                    interruption = exc
 
 
 class _JobProcess(subprocess.Popen):
@@ -178,8 +199,12 @@ class _JobProcess(subprocess.Popen):
             info.lpAttributeList = C.cast(buffer, C.c_void_p)
             process = _ProcessInfo()
             command = subprocess.list2cmdline(args)
+            # Match Popen's Windows batch dispatch/quoting. Passing an explicit
+            # application name here breaks batch filenames containing spaces.
+            # JOB_LIST still applies to the OS-created command-shell wrapper.
+            application = None if os.path.splitext(args[0])[1].lower() in (".bat", ".cmd") else args[0]
             sys.audit("subprocess.Popen", args[0], command, cwd, None)
-            _require(api.CreateProcessW(args[0], C.create_unicode_buffer(command), None, None, True,
+            _require(api.CreateProcessW(application, C.create_unicode_buffer(command), None, None, True,
                                          0x80000 | 0x08000000, None, os.fsdecode(cwd),
                                          C.byref(info), C.byref(process)), "contained process launch")
             self._child_created = True
@@ -194,8 +219,13 @@ class _JobProcess(subprocess.Popen):
 
 def run_contained(arguments: list[str], *, input: str, cwd, timeout: float,
                   capture_output=True, text=True, encoding="utf-8", errors="replace",
-                  check=False, shell=False) -> subprocess.CompletedProcess:
-    """Run one contained process, confirming cleanup before returning or raising."""
+                  check=False, shell=False, wait_for_root_exit: bool = False) -> subprocess.CompletedProcess:
+    """Run contained; test mode ends on root exit, not descendant-held pipe EOF.
+
+    Test mode also fails closed on cleanup errors: no return/raise (and hence no
+    workspace unlock by a synchronous caller) until job emptiness is verified.
+    Codex's existing communication timeout and bounded cleanup stay unchanged.
+    """
     if os.name != "nt" or sys.version_info[:2] != (3, 12):
         raise ProcessSafetyError("Windows containment requires Windows and Python 3.12")
     if not capture_output or not text or encoding != "utf-8" or errors != "replace" or check or shell:
@@ -220,12 +250,17 @@ def run_contained(arguments: list[str], *, input: str, cwd, timeout: float,
         # Bound the whole communication, including a child that never reads stdin.
         communication = Thread(target=communicate, daemon=True)
         communication.start()
-        communication.join(timeout)
-        if communication.is_alive():
-            raise subprocess.TimeoutExpired(arguments, timeout)
-        if isinstance(outcome[0], BaseException):
-            raise outcome[0]
-        stdout, stderr = outcome[0]
+        if wait_for_root_exit:
+            # Observe the root's actual exit code before terminating descendants.
+            # Their inherited output handles must not turn a normal exit into a timeout.
+            process.wait(timeout=timeout)
+        else:
+            communication.join(timeout)
+            if communication.is_alive():
+                raise subprocess.TimeoutExpired(arguments, timeout)
+            if isinstance(outcome[0], BaseException):
+                raise outcome[0]
+            stdout, stderr = outcome[0]
     except BaseException as exc:
         failure = exc
         if isinstance(exc, subprocess.TimeoutExpired):
@@ -233,8 +268,21 @@ def run_contained(arguments: list[str], *, input: str, cwd, timeout: float,
     finally:
         try:
             job.terminate_and_confirm()
-        except ProcessSafetyError as exc:
-            cleanup_errors.append(str(exc))
+        except (Exception, KeyboardInterrupt, SystemExit) as exc:
+            if isinstance(exc, Exception):
+                cleanup_errors.append(str(exc) if isinstance(exc, ProcessSafetyError)
+                                      else f"Windows job cleanup failed ({type(exc).__name__})")
+            else:
+                failure = exc
+            if wait_for_root_exit:
+                try:
+                    logger.critical("Test process cleanup failed; retaining containment and workspace ownership "
+                                    "until Windows confirms no active job members")
+                except Exception:
+                    pass  # A failing log handler must not bypass the safety wait.
+                interruption = job.wait_until_empty(None)
+                if interruption is not None:
+                    failure = interruption
         finally:
             try:
                 job.close()  # OS kill-on-close fallback even if verification failed.
@@ -247,6 +295,8 @@ def run_contained(arguments: list[str], *, input: str, cwd, timeout: float,
                     cleanup_errors.append("Contained output/input cleanup could not be confirmed")
                 elif outcome and not isinstance(outcome[0], BaseException):
                     stdout, stderr = outcome[0]
+                elif outcome and failure is None:
+                    failure = outcome[0]
             try:
                 process.wait(timeout=_CLEANUP_TIMEOUT)
             except (OSError, subprocess.TimeoutExpired):
@@ -263,12 +313,14 @@ def run_contained(arguments: list[str], *, input: str, cwd, timeout: float,
         if failure is not None and not isinstance(failure, Exception):
             failure.add_note(message)
             raise failure
-        prefix = "Codex execution timed out; " if isinstance(failure, subprocess.TimeoutExpired) else ""
+        prefix = "Process execution timed out; " if isinstance(failure, subprocess.TimeoutExpired) else ""
         raise ProcessSafetyError(prefix + message, stdout=stdout, stderr=stderr,
                                  timed_out=isinstance(failure, subprocess.TimeoutExpired),
-                                 exit_code=process.returncode if process is not None else None)
+                                 exit_code=process.returncode if process is not None else None,
+                                 cleanup_error=message)
     if failure is not None:
         if isinstance(failure, subprocess.TimeoutExpired):
             failure.stdout, failure.stderr = stdout, stderr
+            failure.exit_code = process.returncode if process is not None else None
         raise failure
     return subprocess.CompletedProcess(arguments, process.returncode, stdout, stderr)

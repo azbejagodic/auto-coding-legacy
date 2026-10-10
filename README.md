@@ -225,6 +225,9 @@ runner uses `shell=False`, installs no dependencies, and does not change project
 files itself; invoked test programs may produce their usual artifacts. Argument
 lists such as `["npm", "test", "--", "--runInBand"]` and `["cargo", "test"]`
 are supported without choosing a programming language or test framework.
+Executables are resolved on `PATH` before contained Windows launch. As with
+stdlib `Popen`, Windows can interpret `.cmd`/`.bat` commands through its system
+shell despite `shell=False`; use only trusted, preapproved commands/arguments.
 
 The complete plan is validated before starting. Commands execute sequentially
 with the same configurable per-command timeout and stop on the first failure.
@@ -234,14 +237,37 @@ total duration, and error details. Each `CommandResult` contains the exact
 arguments, exit code, stdout/stderr, duration, success, timeout flag, and any
 execution or cleanup error. Only exit code zero without execution errors passes.
 
-On timeout, Windows uses the system `taskkill /PID <launched-pid> /T /F` and
-POSIX uses a dedicated process group. Cleanup and output-drain waits are bounded;
-failures are reported, with a direct-child termination fallback. No administrator
-permissions are requested. Detached descendants or Windows children whose
-parent already exited may escape tree cleanup; this is reported if output pipes
-remain open or the parent has exited at timeout. Tests must not deliberately
-detach background services. No sandbox is added: approved test commands run
-with the caller's normal permissions.
+On Windows 10 / Server 2016 or newer, each command uses the same creation-time
+Job Object containment as Codex. No command executes before assignment; setup
+failure never falls back to uncontained execution. Normal and detached descendants
+inherit the job, with breakaway disabled. After the direct command exits, its real
+exit code is retained and surviving job members are terminated before output is
+returned or another command starts. Descendant-held output pipes do not extend
+a normally exiting command to its timeout. Timeouts terminate the entire job.
+Controller death closes its non-inheritable job handle, triggering OS cleanup.
+No PID scanning, unrelated process termination, or administrator rights are used.
+See Microsoft's [Job Object lifecycle](https://learn.microsoft.com/en-us/windows/win32/procthread/job-objects)
+and [creation-time assignment](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-updateprocthreadattribute).
+
+Cleanup normally has a five-second verification deadline. If tree termination or
+verification fails, execution fails closed: a critical message is logged and the
+job and caller's workspace lock remain held until Windows confirms zero active
+members. This emergency wait can exceed the command timeout indefinitely if OS
+termination/accounting remains unavailable; cancellation is deferred until the
+job is empty. There are no task retries. Inspect the error and manually recover;
+forcibly terminating the controller invokes OS kill-on-close as described above.
+Even if cleanup subsequently completes, its original error remains a failure:
+exit code zero cannot authorize a commit or GitHub review. Pipe/handle cleanup
+errors are also reported, never treated as successful tests.
+
+Non-Windows behavior is unchanged: timeout cleanup targets a dedicated process
+group with bounded waits and a direct-child fallback. Successful commands do not
+clean up background children; detached processes and children surviving controller
+death can escape. Use trusted foreground commands there. On all platforms, work
+delegated to external services is not an ordinary contained descendant. Job
+containment is lifecycle management, not a security sandbox: test commands retain
+the caller's permissions. Abrupt-death lock release and OS tree termination are
+not atomic; inspect the workspace before manual recovery.
 
 Logs identify the executable and argument count, timing, and status. Argument
 values, environment variables, and captured output are not logged. Returned
@@ -338,7 +364,8 @@ injection via `lock_factory` permits isolated testing or a shared local location
 
 Different workspaces can run independently. Locks coordinate cooperating local
 controllers only, not unrelated editors/processes or separate computers/checkouts.
-On Windows, controller death triggers OS job cleanup for contained Codex
-descendants, subject to the limitations described above. Elsewhere, orphaned
-Codex children may continue modifying files after the lock is released; inspect
-and stop them before resuming. Crash recovery is not implemented.
+On Windows, controller death triggers OS job cleanup for contained Codex and test
+descendants, subject to the limitations described above. During normal execution,
+the test runner confirms job emptiness before returning to the locked controller.
+Elsewhere, orphaned Codex/test children may continue modifying files after the lock
+is released; inspect and stop them before resuming. Crash recovery is not implemented.
