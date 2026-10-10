@@ -1,6 +1,6 @@
 # auto-coding
 
-Local foundation for the auto-coding development workflow, with read-only prerequisite diagnostics, logging, SQLite task storage, and pytest setup. Browser automation, Codex execution, GitHub automation, and the dashboard are intentionally not implemented yet.
+Local foundation for the auto-coding development workflow, with read-only prerequisite diagnostics, logging, SQLite task storage, a single-task Codex CLI runner, and pytest setup. Browser automation, GitHub automation, and the dashboard are intentionally not implemented yet.
 
 ## Requirements
 
@@ -76,3 +76,35 @@ returns `None`; updating a missing task raises `KeyError`. Tasks are listed by
 transition rules. Acceptance criteria are serialized as JSON, and timestamps
 are UTC ISO 8601 strings. Database files and SQLite sidecar files are ignored
 by Git. Use the context manager to close the connection, or call `close()`.
+
+## Codex CLI runner
+
+`auto_coding.integrations.codex.run_codex(prompt, model, working_directory,
+timeout=600.0)` executes one prepared task and returns a typed `CodexResult`.
+Calling this function starts a real Codex task using existing CLI authentication
+and consumes the corresponding model usage. Configure Codex with your ChatGPT
+login locally; the runner does not set credentials or call the OpenAI API directly.
+
+The runner uses `codex exec --model <model> --sandbox workspace-write --json
+--color never -`, passing the full prompt through stdin with `shell=False`.
+The model is passed exactly as supplied, with no retry or fallback. The working
+directory must exist and Codex's normal Git repository checks remain enabled.
+On Windows, put the native `codex.exe` on `PATH`; `.cmd`/`.bat` shims are rejected
+because Windows can implicitly launch them through a command shell.
+
+The result includes success, requested model, exit code, last completed agent
+message (if present), stdout, stderr, parsed events, error, duration in seconds,
+and a timeout flag. Success requires exit code zero, a completed turn, and no
+malformed/error events. Unknown event types are retained. Success describes CLI
+completion only; code changes and tests still require independent verification.
+
+Expected input, launch, CLI, output, and timeout failures return unsuccessful
+results. Timeouts kill and wait for the direct CLI process; descendant process
+tree termination is not guaranteed. Output is buffered in memory until exit.
+The caller configures the existing logging system; the runner logs metadata
+without prompts, output, tokens, or session IDs. Returned output can contain
+private information and should be handled accordingly. Tests mock all Codex
+execution and do not consume model usage.
+
+Argument handling was checked against the installed CLI's `codex exec --help`.
+JSONL parsing follows the [official non-interactive mode documentation](https://developers.openai.com/codex/noninteractive).
