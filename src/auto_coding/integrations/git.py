@@ -224,12 +224,14 @@ class GitRepository:
                 raw = Path(supplied)
                 if ".." in raw.parts:
                     raise GitError("commit", "Parent traversal is not allowed")
+                if any(any(char in part for char in "*?[]") or part.startswith(":") for part in raw.parts):
+                    raise GitError("commit", "Wildcard and pathspec-magic inputs are forbidden")
                 path = raw if raw.is_absolute() else self.path / raw
                 relative = path.relative_to(self.path)
                 resolved = path.resolve()
                 resolved.relative_to(self.path)
-                if resolved != path or path.is_symlink() or not path.is_file():
-                    raise GitError("commit", "Selected paths must be existing regular files without symlinks")
+                if resolved != path or path.is_symlink() or (path.exists() and not path.is_file()):
+                    raise GitError("commit", "Selected paths must be regular files without symlinks")
             except (ValueError, TypeError, OSError):
                 raise GitError("commit", "Selected file path is invalid or outside the repository") from None
             parts = {part.casefold() for part in relative.parts}
@@ -240,6 +242,15 @@ class GitRepository:
             file = relative.as_posix()
             if self._run("check-ignore", "--no-index", "--quiet", "--", file, allowed=(0, 1)).returncode == 0:
                 raise GitError("commit", "Ignored file selection is forbidden")
+            if not path.exists():
+                # The index must be clean before this method is called. Verify
+                # an exact committed file, not a directory/prefix match, gitlink,
+                # removed symlink, or an untracked missing name.
+                entries = self._run("ls-tree", "-z", "HEAD", "--", file).stdout.split("\x00")
+                records = [entry.partition("\t") for entry in entries if entry]
+                if (len(records) != 1 or records[0][2] != file
+                        or records[0][0].split()[:2] not in (["100644", "blob"], ["100755", "blob"])):
+                    raise GitError("commit", "Missing path must be an exact tracked regular file")
             selected.append(file)
         return list(dict.fromkeys(selected))
 
@@ -252,7 +263,7 @@ class GitRepository:
             raise GitError("commit", "Index already contains staged changes; inspect it manually")
         selected = self._selected_paths(files)
         before = self.current_commit_sha()
-        self._run("add", "--", *selected)
+        self._run("add", "--no-ignore-removal", "--", *selected)
         staged = set(self._run("diff", "--cached", "--name-only", "-z").stdout.strip("\x00").split("\x00")) - {""}
         if not staged:
             raise GitError("commit", "Selected files have no changes; empty commits are forbidden")

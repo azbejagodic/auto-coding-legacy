@@ -127,9 +127,12 @@ or push. The interface is independent of task storage and Codex:
 - `commit_files(expected_branch, ["src/example.py"], "Commit message")`
   stages only validated, explicitly selected files and returns a `GitResult`
   with the full commit SHA. The existing index must be empty. Ignored files,
-  known credential/session paths, directories, symlinks, traversal, missing
-  files, and paths outside the repository are rejected. Deletions are not
-  supported by this initial interface. Empty commits are rejected.
+  known credential/session paths, directories, symlinks, traversal, wildcard
+  and pathspec-magic inputs, and paths outside the repository are rejected.
+  Missing files are accepted only when the exact path was a regular file in
+  `HEAD`; this stages an already-occurring deletion without deleting anything.
+  Additions, modifications, and selected deletions can share one commit.
+  Untracked missing files and empty commits are rejected.
 - `push_branch(expected_branch, expected_commit_sha)` requires HEAD to match,
   pushes only that branch without force, queries origin to verify its SHA,
   and returns a `GitResult`. Supported github.com HTTPS/SSH remotes also yield

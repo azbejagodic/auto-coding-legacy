@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 import subprocess
 from unittest.mock import Mock
 
@@ -300,3 +301,150 @@ def test_unfinished_operation_rejected(repository):
     (repository.path / ".git" / "MERGE_HEAD").write_text(repository.current_commit_sha(), encoding="utf-8")
     with pytest.raises(GitError, match="unfinished"):
         repository.commit_files(branch, ["initial.txt"], "message")
+
+
+def test_tracked_deletion_is_explicitly_staged_and_committed(repository, monkeypatch):
+    branch = repository.create_development_branch().branch
+    previous = repository.current_commit_sha()
+    (repository.path / "initial.txt").unlink()
+    (repository.path / "unselected.txt").write_text("keep untracked", encoding="utf-8")
+    original = repository._run
+    staged = []
+
+    def run(*args, **kwargs):
+        if args[0] == "commit":
+            staged.append(git(repository.path, "diff", "--cached", "--name-status"))
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(repository, "_run", run)
+    result = repository.commit_files(branch, ["initial.txt"], "Delete selected file")
+    assert staged == ["D\tinitial.txt"]
+    assert result.commit_sha != previous
+    assert result.commit_sha == repository.current_commit_sha()
+    assert git(repository.path, "diff-tree", "--no-commit-id", "--name-status", "-r", "HEAD") == "D\tinitial.txt"
+    assert not (repository.path / "initial.txt").exists()
+    assert "unselected.txt" in git(repository.path, "status", "--porcelain")
+
+
+def test_mixed_add_modify_delete_only_selected_files(repository):
+    branch = repository.create_development_branch().branch
+    for name in ("modify.txt", "untouched.txt"):
+        (repository.path / name).write_text("original\n", encoding="utf-8")
+    repository.commit_files(branch, ["modify.txt", "untouched.txt"], "Seed tracked files")
+    (repository.path / "initial.txt").unlink()
+    (repository.path / "modify.txt").write_text("modified\n", encoding="utf-8")
+    (repository.path / "added.txt").write_text("new content\n", encoding="utf-8")
+    (repository.path / "untouched.txt").unlink()  # Deliberately not selected.
+    result = repository.commit_files(branch, ["initial.txt", "modify.txt", "added.txt"], "Mixed changes")
+    assert set(git(repository.path, "diff-tree", "--no-commit-id", "--no-renames", "--name-status", "-r", "HEAD").splitlines()) == {
+        "D\tinitial.txt", "M\tmodify.txt", "A\tadded.txt",
+    }
+    assert len(result.commit_sha) == 40
+    assert git(repository.path, "status", "--porcelain") == "D untouched.txt"
+
+
+def test_untracked_missing_file_does_not_stage_valid_deletion(repository):
+    branch = repository.create_development_branch().branch
+    (repository.path / "initial.txt").unlink()
+    with pytest.raises(GitError, match="exact tracked regular file"):
+        repository.commit_files(branch, ["initial.txt", "never-tracked.txt"], "Reject plan")
+    assert not git(repository.path, "diff", "--cached", "--name-only")
+    assert git(repository.path, "status", "--porcelain") == "D initial.txt"
+
+
+@pytest.mark.parametrize("name", [".env", "auth.json", "credentials/token.json"])
+def test_tracked_sensitive_deletions_still_rejected(repository, name):
+    branch = repository.create_development_branch().branch
+    path = repository.path / name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("dummy fixture data", encoding="utf-8")
+    git(repository.path, "add", "--", name)
+    git(repository.path, "commit", "--no-gpg-sign", "-m", "Seed sensitive-name fixture")
+    path.unlink()
+    with pytest.raises(GitError, match="Credential or session"):
+        repository.commit_files(branch, [name], "Reject sensitive deletion")
+    assert not git(repository.path, "diff", "--cached", "--name-only")
+
+
+def test_missing_protected_and_outside_paths_rejected(repository, tmp_path):
+    branch = repository.create_development_branch().branch
+    for path in (".git/missing", "../missing.txt", tmp_path / "missing.txt"):
+        with pytest.raises(GitError):
+            repository.commit_files(branch, [path], "Reject unsafe deletion")
+    assert not git(repository.path, "diff", "--cached", "--name-only")
+
+
+@pytest.mark.parametrize("pathspec", ["*", "*.txt", "initial.?xt", "[i]nitial.txt", ":(glob)*", ":(top)initial.txt", ":!initial.txt"])
+def test_unsafe_deletion_pathspecs_rejected(repository, pathspec):
+    branch = repository.create_development_branch().branch
+    (repository.path / "initial.txt").unlink()
+    with pytest.raises(GitError, match="Wildcard and pathspec-magic"):
+        repository.commit_files(branch, [pathspec], "Reject pathspec")
+    assert not git(repository.path, "diff", "--cached", "--name-only")
+
+
+def test_deleted_file_on_main_cannot_be_committed(repository):
+    sha = repository.current_commit_sha()
+    (repository.path / "initial.txt").unlink()
+    with pytest.raises(GitError, match="protected"):
+        repository.commit_files("main", ["initial.txt"], "Forbidden")
+    assert repository.current_commit_sha() == sha
+    assert not git(repository.path, "diff", "--cached", "--name-only")
+
+
+def test_deleted_directory_not_treated_as_a_file(repository):
+    branch = repository.create_development_branch().branch
+    directory = repository.path / "nested"
+    directory.mkdir()
+    file = directory / "file.txt"
+    file.write_text("tracked", encoding="utf-8")
+    repository.commit_files(branch, ["nested/file.txt"], "Seed nested file")
+    file.unlink()
+    directory.rmdir()
+    with pytest.raises(GitError, match="exact tracked regular file"):
+        repository.commit_files(branch, ["nested"], "Reject directory selection")
+    assert not git(repository.path, "diff", "--cached", "--name-only")
+    # A missing parent directory still permits its exact selected tracked file.
+    repository.commit_files(branch, ["nested/file.txt"], "Delete nested file")
+
+
+def test_deleted_file_rejects_symlink_parent_escape(repository, tmp_path, monkeypatch):
+    branch = repository.create_development_branch().branch
+    candidate = repository.path / "link" / "deleted.txt"
+    original = Path.resolve
+
+    def resolve(path, *args, **kwargs):
+        # Simulate a symlink/junction on Windows without requiring symlink privileges.
+        if path == candidate:
+            return tmp_path / "outside" / "deleted.txt"
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "resolve", resolve)
+    with pytest.raises(GitError, match="outside the repository"):
+        repository.commit_files(branch, ["link/deleted.txt"], "Reject escape")
+    assert not git(repository.path, "diff", "--cached", "--name-only")
+
+
+def test_deleted_symlink_git_mode_rejected(repository, monkeypatch):
+    branch = repository.create_development_branch().branch
+    original = repository._run
+
+    def run(*args, **kwargs):
+        if args[0] == "ls-tree":
+            return subprocess.CompletedProcess(args, 0, f"120000 blob {'a' * 40}\tdeleted-link\x00", "")
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(repository, "_run", run)
+    with pytest.raises(GitError, match="exact tracked regular file"):
+        repository.commit_files(branch, ["deleted-link"], "Reject deleted symlink")
+
+
+def test_deletion_accepts_native_absolute_path_with_spaces(repository):
+    branch = repository.create_development_branch().branch
+    file = repository.path / "nested folder" / "deleted file.txt"
+    file.parent.mkdir()
+    file.write_text("tracked", encoding="utf-8")
+    repository.commit_files(branch, [file], "Seed spaced path")
+    file.unlink()
+    repository.commit_files(branch, [str(file)], "Delete native absolute path")
+    assert git(repository.path, "diff-tree", "--no-commit-id", "--name-status", "-r", "HEAD") == "D\tnested folder/deleted file.txt"
