@@ -1,0 +1,223 @@
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
+import logging
+import sqlite3
+from threading import Barrier
+from unittest.mock import Mock
+
+import pytest
+
+from auto_coding.controller import SingleTaskController
+from auto_coding.integrations.codex import CodexResult
+from auto_coding.storage import TaskStatus, TaskStore
+from auto_coding.test_runner import CommandResult, TestRunResult as RunResult
+
+
+@pytest.fixture
+def setup(tmp_path):
+    path = tmp_path / "tasks.sqlite3"
+    with TaskStore(path) as store:
+        store.add_task(task_id="TASK-A", title="Selected task", prompt="Private saved prompt ž",
+                       model="exact-model", task_order=1, acceptance_criteria=["Tests pass"])
+        store.add_task(task_id="TASK-B", title="Next task", prompt="Never execute",
+                       model="other-model", task_order=2, acceptance_criteria=[])
+        codex = Mock(return_value=CodexResult(True, "exact-model", 0, "private answer", "private output", ""))
+        command = CommandResult(("tool", "test"), 0, "private tests", "", 0.1, True)
+        tests = Mock(return_value=RunResult(True, (command,), None, 0.1))
+        controller = SingleTaskController(store, codex_runner=codex, test_runner=tests)
+        yield path, store, controller, codex, tests, tmp_path
+
+
+def execute(setup, **kwargs):
+    return setup[2].execute("TASK-A", setup[5], [["tool", "test"]], **kwargs)
+
+
+def test_success_forwards_saved_prompt_model_directory_timeouts_and_persists(setup, caplog):
+    path, store, controller, codex, tests, directory = setup
+
+    def run(**kwargs):
+        assert store.get_task("TASK-A").status == TaskStatus.RUNNING
+        return CodexResult(True, "exact-model", 0, "private answer", "private output", "")
+
+    codex.side_effect = run
+    with caplog.at_level(logging.INFO):
+        result = execute(setup, codex_timeout=12, test_timeout=8)
+    assert result.success and result.final_status == TaskStatus.READY_TO_COMMIT
+    assert result.model == "exact-model" and result.task_id == "TASK-A"
+    assert result.error is None and not result.state_uncertain
+    assert result.codex_result.final_response == "private answer"
+    assert result.test_result == tests.return_value
+    assert result.duration_seconds >= 0
+    codex.assert_called_once_with(prompt="Private saved prompt ž", model="exact-model",
+                                  working_directory=directory.resolve(), timeout=12)
+    tests.assert_called_once_with(working_directory=directory.resolve(), commands=(("tool", "test"),), timeout=8)
+    with TaskStore(path) as reopened:
+        assert reopened.get_task("TASK-A").status == TaskStatus.READY_TO_COMMIT
+        assert reopened.get_task("TASK-B").status == TaskStatus.QUEUED
+    for secret in ("Private saved prompt", "private answer", "private output", "private tests"):
+        assert secret not in caplog.text
+
+
+def test_missing_task_does_not_execute(setup):
+    result = setup[2].execute("missing", setup[5], [["tool"]])
+    assert not result.success and result.final_status is None
+    assert "does not exist" in result.error
+    setup[3].assert_not_called()
+    setup[4].assert_not_called()
+
+
+@pytest.mark.parametrize("status", [status for status in TaskStatus if status != TaskStatus.QUEUED])
+def test_only_queued_task_may_start(setup, status):
+    setup[1].update_status("TASK-A", status)
+    result = execute(setup)
+    assert not result.success and result.final_status == status
+    assert setup[1].get_task("TASK-A").status == status
+    setup[3].assert_not_called()
+    setup[4].assert_not_called()
+
+
+def test_concurrent_controllers_cannot_both_execute(setup):
+    path = setup[0]
+    barrier = Barrier(2)
+    codex, tests = setup[3:5]
+
+    def worker():
+        with TaskStore(path) as store:
+            original = store.get_task
+            first = True
+
+            def retrieve(task_id):
+                nonlocal first
+                task = original(task_id)
+                if first:
+                    first = False
+                    barrier.wait(timeout=5)  # Both observed queued before either claims.
+                return task
+
+            store.get_task = retrieve
+            return SingleTaskController(store, codex_runner=codex, test_runner=tests).execute(
+                "TASK-A", setup[5], [["tool", "test"]],
+            )
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(lambda _: worker(), range(2)))
+    assert sum(result.success for result in results) == 1
+    assert any("already claimed" in (result.error or "") for result in results)
+    codex.assert_called_once()
+    tests.assert_called_once()
+    assert setup[1].get_task("TASK-A").status == TaskStatus.READY_TO_COMMIT
+
+
+@pytest.mark.parametrize("timed_out", [False, True])
+def test_codex_failure_or_timeout_stops_tests_and_does_not_retry(setup, timed_out):
+    setup[3].return_value = replace(setup[3].return_value, success=False, exit_code=None if timed_out else 1,
+                                   error="Codex unavailable or timed out", timed_out=timed_out)
+    result = execute(setup)
+    assert not result.success and result.final_status == TaskStatus.FAILED
+    assert result.codex_result.timed_out == timed_out
+    assert result.test_result is None
+    assert setup[1].get_task("TASK-A").status == TaskStatus.FAILED
+    setup[3].assert_called_once()
+    setup[4].assert_not_called()
+    execute(setup)  # No automatic rerun of failed tasks.
+    setup[3].assert_called_once()
+
+
+@pytest.mark.parametrize("timed_out", [False, True])
+def test_test_failure_or_timeout_persists_failed(setup, timed_out):
+    command = replace(setup[4].return_value.commands[0], success=False, exit_code=1,
+                      timed_out=timed_out, error="required test failed")
+    setup[4].return_value = RunResult(False, (command,), command, 0.1, "required tests failed")
+    result = execute(setup)
+    assert not result.success and result.final_status == TaskStatus.FAILED
+    assert result.test_result.failed_command.timed_out == timed_out
+    assert setup[1].get_task("TASK-A").status == TaskStatus.FAILED
+    setup[3].assert_called_once()
+    setup[4].assert_called_once()
+
+
+@pytest.mark.parametrize("commands", [[], "tool test", [[]], [["tool"], ["bad\x00arg"]]])
+def test_invalid_test_configuration_rejected_before_codex(setup, commands):
+    result = setup[2].execute("TASK-A", setup[5], commands)
+    assert not result.success and result.final_status == TaskStatus.FAILED
+    assert "Invalid test configuration" in result.error
+    setup[3].assert_not_called()
+    setup[4].assert_not_called()
+
+
+def test_empty_test_result_cannot_pass(setup):
+    setup[4].return_value = RunResult(True, (), None, 0.1)
+    assert execute(setup).final_status == TaskStatus.FAILED
+
+
+def test_incomplete_test_plan_cannot_pass(setup):
+    result = setup[2].execute("TASK-A", setup[5], [["tool", "test"], ["other", "test"]])
+    assert not result.success and result.final_status == TaskStatus.FAILED
+
+
+def test_inconsistent_test_success_with_failed_command_cannot_pass(setup):
+    tests = setup[4].return_value
+    setup[4].return_value = replace(tests, commands=(replace(tests.commands[0], exit_code=1),))
+    assert execute(setup).final_status == TaskStatus.FAILED
+
+
+def test_database_retrieval_and_claim_errors_stop_execution(setup, monkeypatch):
+    original = setup[1].get_task
+    monkeypatch.setattr(setup[1], "get_task", Mock(side_effect=sqlite3.OperationalError("private db data")))
+    result = execute(setup)
+    assert not result.success and result.state_uncertain
+    monkeypatch.setattr(setup[1], "get_task", original)
+    monkeypatch.setattr(setup[1], "claim_task", Mock(side_effect=sqlite3.OperationalError("private db data")))
+    result = execute(setup)
+    assert not result.success and result.state_uncertain and result.final_status is None
+    assert "private db data" not in result.error
+    setup[3].assert_not_called()
+    setup[4].assert_not_called()
+
+
+def test_failure_persistence_error_reports_uncertain_state(setup, monkeypatch):
+    setup[3].return_value = replace(setup[3].return_value, success=False, error="execution failure")
+    monkeypatch.setattr(setup[1], "update_status", Mock(side_effect=sqlite3.OperationalError("db locked")))
+    result = execute(setup)
+    assert not result.success and result.state_uncertain
+    assert result.final_status is None
+    assert "state is uncertain" in result.error
+    assert setup[1].get_task("TASK-A").status == TaskStatus.RUNNING
+
+
+def test_ready_status_persistence_error_attempts_failed(setup, monkeypatch):
+    original = setup[1].update_status
+
+    def update(task_id, status):
+        if status == TaskStatus.READY_TO_COMMIT:
+            raise sqlite3.OperationalError("db error")
+        original(task_id, status)
+
+    monkeypatch.setattr(setup[1], "update_status", update)
+    result = execute(setup)
+    assert not result.success and not result.state_uncertain
+    assert result.final_status == TaskStatus.FAILED
+    assert "Could not persist ready_to_commit" in result.error
+
+
+@pytest.mark.parametrize("runner_index", [3, 4])
+def test_unexpected_runner_exception_records_failure_without_private_logs(setup, runner_index, caplog):
+    setup[runner_index].side_effect = RuntimeError("private prompt token")
+    result = execute(setup)
+    assert not result.success and result.final_status == TaskStatus.FAILED
+    assert "RuntimeError" in result.error
+    assert "private prompt token" not in result.error + caplog.text
+
+
+def test_interrupted_task_stays_running_and_cannot_restart(setup):
+    setup[3].side_effect = KeyboardInterrupt
+    with pytest.raises(KeyboardInterrupt):
+        execute(setup)
+    with TaskStore(setup[0]) as reopened:
+        assert reopened.get_task("TASK-A").status == TaskStatus.RUNNING
+        result = SingleTaskController(reopened, codex_runner=setup[3], test_runner=setup[4]).execute(
+            "TASK-A", setup[5], [["tool"]],
+        )
+        assert not result.success and result.final_status == TaskStatus.RUNNING
+    setup[3].assert_called_once()
+    setup[4].assert_not_called()

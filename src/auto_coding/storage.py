@@ -14,6 +14,7 @@ from types import TracebackType
 class TaskStatus(StrEnum):
     QUEUED = "queued"
     RUNNING = "running"
+    READY_TO_COMMIT = "ready_to_commit"
     AWAITING_REVIEW = "awaiting_review"
     APPROVED = "approved"
     REJECTED = "rejected"
@@ -78,6 +79,13 @@ class TaskStore:
         self._connection.row_factory = sqlite3.Row
         try:
             with self._connection:
+                # Serialize schema initialization/migration across connections.
+                self._connection.execute("BEGIN IMMEDIATE")
+                existing = self._connection.execute(
+                    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'tasks'"
+                ).fetchone()
+                if existing and "'ready_to_commit'" not in existing["sql"]:
+                    self._connection.execute("ALTER TABLE tasks RENAME TO tasks_legacy")
                 self._connection.execute("""
                     CREATE TABLE IF NOT EXISTS tasks (
                         task_id TEXT PRIMARY KEY NOT NULL,
@@ -87,13 +95,22 @@ class TaskStore:
                         task_order INTEGER NOT NULL,
                         status TEXT NOT NULL CHECK (status IN (
                             'queued', 'running', 'awaiting_review',
-                            'approved', 'rejected', 'failed'
+                            'approved', 'rejected', 'failed', 'ready_to_commit'
                         )),
                         acceptance_criteria TEXT NOT NULL,
                         created_at TEXT NOT NULL,
                         updated_at TEXT NOT NULL
                     )
                 """)
+                if existing and "'ready_to_commit'" not in existing["sql"]:
+                    self._connection.execute("""
+                        INSERT INTO tasks (task_id, title, prompt, model, task_order,
+                                           status, acceptance_criteria, created_at, updated_at)
+                        SELECT task_id, title, prompt, model, task_order,
+                               status, acceptance_criteria, created_at, updated_at
+                        FROM tasks_legacy
+                    """)
+                    self._connection.execute("DROP TABLE tasks_legacy")
         except Exception:
             self._connection.close()
             raise
@@ -168,3 +185,16 @@ class TaskStore:
             )
             if cursor.rowcount == 0:
                 raise KeyError(f"Task {task_id!r} does not exist")
+
+    def claim_task(self, task_id: str) -> bool:
+        """Atomically claim a queued task; False means missing or already claimed.
+
+        The conditional write and commit happen before returning. Each controller
+        invocation should use its own connection (SQLite's normal thread rules).
+        """
+        with self._connection:
+            cursor = self._connection.execute(
+                "UPDATE tasks SET status = ?, updated_at = ? WHERE task_id = ? AND status = ?",
+                (TaskStatus.RUNNING, _timestamp(), task_id, TaskStatus.QUEUED),
+            )
+        return cursor.rowcount == 1

@@ -108,3 +108,39 @@ def test_acceptance_criteria_must_be_list_of_strings(database_path, task_data):
         with pytest.raises(ValueError, match="list of strings"):
             store.add_task(**(task_data | {"acceptance_criteria": "not a list"}))
         assert store.list_tasks() == []
+
+
+def test_claim_only_queued_tasks_and_persist(database_path, task_data):
+    with TaskStore(database_path) as store:
+        store.add_task(**task_data)
+        assert not store.claim_task("missing")
+        assert store.claim_task(task_data["task_id"])
+        assert not store.claim_task(task_data["task_id"])
+    with TaskStore(database_path) as reopened:
+        assert reopened.get_task(task_data["task_id"]).status == TaskStatus.RUNNING
+        assert not reopened.claim_task(task_data["task_id"])
+
+
+def test_legacy_schema_migration_preserves_data(database_path, task_data):
+    database_path.parent.mkdir(parents=True)
+    with sqlite3.connect(database_path) as connection:
+        connection.execute("""CREATE TABLE tasks (
+            task_id TEXT PRIMARY KEY NOT NULL, title TEXT NOT NULL,
+            prompt TEXT NOT NULL, model TEXT NOT NULL, task_order INTEGER NOT NULL,
+            status TEXT NOT NULL CHECK(status IN (
+                'queued', 'running', 'awaiting_review', 'approved', 'rejected', 'failed'
+            )), acceptance_criteria TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
+        )""")
+        for order, status in enumerate(("queued", "running", "awaiting_review", "approved", "rejected", "failed")):
+            connection.execute("INSERT INTO tasks VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                               (status, task_data["title"], task_data["prompt"], task_data["model"], order,
+                                status, json.dumps(task_data["acceptance_criteria"]), "created", "updated"))
+        original = connection.execute("SELECT * FROM tasks ORDER BY task_order").fetchall()
+    with TaskStore(database_path) as store:
+        assert len(store.list_tasks()) == 6
+        with sqlite3.connect(database_path) as connection:
+            assert connection.execute("SELECT * FROM tasks ORDER BY task_order").fetchall() == original
+        store.update_status("queued", TaskStatus.READY_TO_COMMIT)
+    with TaskStore(database_path) as reopened:
+        assert reopened.get_task("queued").status == TaskStatus.READY_TO_COMMIT
+        assert len(reopened.list_tasks()) == 6

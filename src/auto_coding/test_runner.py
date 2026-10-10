@@ -146,6 +146,32 @@ def _execute(arguments: tuple[str, ...], directory: Path, timeout: float) -> Com
                          success, timed_out, error, cleanup_error)
 
 
+def validate_test_plan(
+    working_directory: str | Path,
+    commands: Sequence[Sequence[str]],
+    timeout: float = 600.0,
+) -> tuple[Path, tuple[tuple[str, ...], ...]]:
+    """Validate and snapshot a trusted test plan without launching processes."""
+    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError("Timeout must be finite and positive")
+    try:
+        directory = Path(working_directory).resolve()
+        if not directory.is_dir():
+            raise ValueError("Project directory does not exist or is not a directory")
+    except (OSError, TypeError):
+        raise ValueError("Project directory is invalid or inaccessible") from None
+    if not isinstance(commands, (list, tuple)) or not commands:
+        raise ValueError("At least one approved test command is required")
+    approved = []
+    for command in commands:
+        if (not isinstance(command, (list, tuple)) or not command
+                or any(not isinstance(arg, str) or "\x00" in arg for arg in command)
+                or not command[0].strip()):
+            raise ValueError("Each approved command must be a nonempty argument list without NUL characters")
+        approved.append(tuple(command))
+    return directory, tuple(approved)
+
+
 def run_tests(
     working_directory: str | Path,
     commands: Sequence[Sequence[str]],
@@ -171,24 +197,10 @@ def run_tests(
                     success, len(results), duration, error)
         return TestRunResult(success, tuple(results), failed, duration, error)
 
-    if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout <= 0:
-        return finish([], "Timeout must be finite and positive")
     try:
-        directory = Path(working_directory).resolve()
-        if not directory.is_dir():
-            return finish([], "Project directory does not exist or is not a directory")
-    except (OSError, ValueError, TypeError):
-        return finish([], "Project directory is invalid or inaccessible")
-    if not isinstance(commands, (list, tuple)) or not commands:
-        return finish([], "At least one approved test command is required")
-    approved = []
-    # Validate and copy the entire plan before executing any command.
-    for command in commands:
-        if (not isinstance(command, (list, tuple)) or not command
-                or any(not isinstance(arg, str) or "\x00" in arg for arg in command)
-                or not command[0].strip()):
-            return finish([], "Each approved command must be a nonempty argument list without NUL characters")
-        approved.append(tuple(command))
+        directory, approved = validate_test_plan(working_directory, commands, timeout)
+    except ValueError as exc:
+        return finish([], str(exc))
     results = []
     for command in approved:
         result = _execute(command, directory, timeout)

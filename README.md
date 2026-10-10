@@ -1,6 +1,6 @@
 # auto-coding
 
-Local foundation for the auto-coding development workflow, with read-only prerequisite diagnostics, logging, SQLite task storage, a single-task Codex CLI runner, explicit Git/GitHub operations, a language-independent test runner, and pytest setup. Browser automation, workflow orchestration, and the dashboard are intentionally not implemented yet.
+Local foundation for the auto-coding development workflow, with read-only prerequisite diagnostics, logging, SQLite task storage, a Codex CLI runner, explicit Git/GitHub operations, a language-independent test runner, a single-task controller, and pytest setup. Browser automation, automatic multi-task scheduling, and the dashboard are intentionally not implemented yet.
 
 ## Requirements
 
@@ -72,8 +72,11 @@ Run the example insertion only once per database: duplicate IDs raise
 `DuplicateTaskError`. Invalid statuses raise `ValueError`. A missing lookup
 returns `None`; updating a missing task raises `KeyError`. Tasks are listed by
 `task_order`, with ties sorted by ID. Statuses are `queued`, `running`,
-`awaiting_review`, `approved`, `rejected`, and `failed`; storage does not impose
-transition rules. Acceptance criteria are serialized as JSON, and timestamps
+`ready_to_commit`, `awaiting_review`, `approved`, `rejected`, and `failed`.
+General status updates do not impose transition rules; `claim_task(task_id)`
+atomically changes only queued tasks to running, returning whether it succeeded.
+Existing foundation databases are migrated transactionally on opening to permit
+the new status while preserving their task data. Acceptance criteria are serialized as JSON, and timestamps
 are UTC ISO 8601 strings. Database files and SQLite sidecar files are ignored
 by Git. Use the context manager to close the connection, or call `close()`.
 
@@ -198,3 +201,44 @@ arguments/output may contain private data; callers must handle them accordingly.
 Output is buffered in memory. Configure logging through the existing logging
 setup before calling the runner. No workflow, retry, Git, or database operations
 are connected to this module.
+
+## Single-task controller
+
+`SingleTaskController` connects caller-owned storage to the existing Codex and
+test runners. Calling `execute()` launches a real task and consumes Codex model
+usage; tests inject mocks instead. Explicitly choose one queued task and supply
+trusted, preapproved test commands:
+
+```python
+from auto_coding.controller import SingleTaskController
+from auto_coding.storage import TaskStore
+
+with TaskStore("runtime/tasks.sqlite3") as store:
+    controller = SingleTaskController(store)
+    result = controller.execute(
+        "TASK-EXAMPLE", ".", [["python", "-m", "pytest"]],
+        codex_timeout=600, test_timeout=120,
+    )
+```
+
+The task must already exist. A conditional SQLite write claims `queued → running`
+before launching Codex, so two invocations cannot both claim it. Test configuration
+is validated using the test runner's shared validator before model execution.
+Codex receives the saved prompt/model unchanged. Only successful Codex completion
+and completion of every required test allow `running → ready_to_commit`. This
+status does not imply a Git commit or code review. The controller performs no Git
+operations and never selects or executes another task.
+
+Failures after claiming attempt `running → failed`. If persistence fails, the
+result explicitly reports `state_uncertain=True` and `final_status=None`. No
+automatic retry occurs. `KeyboardInterrupt` and `SystemExit` propagate; a task
+left `running` is refused on future invocations and requires manual recovery.
+
+`ExecutionResult` includes task ID, assigned model, final status, original Codex
+and test result objects, overall success, error, duration, and uncertainty flag.
+Prompts, outputs, and raw exception messages are not copied into controller logs.
+Configure logging through the existing logging setup. Inject `codex_runner` and
+`test_runner` callables into the constructor for testing. Each invocation needs
+its own `TaskStore` connection; claiming protects a task ID, not simultaneous
+execution of different tasks in the same workspace. No workspace locking or
+interruption recovery is implemented.
