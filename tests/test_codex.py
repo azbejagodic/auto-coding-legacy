@@ -6,6 +6,7 @@ from unittest.mock import Mock
 import pytest
 
 from auto_coding.integrations.codex import run_codex
+from auto_coding.integrations.windows_process import ProcessSafetyError
 
 
 def jsonl(*events):
@@ -24,7 +25,7 @@ def process(monkeypatch):
     # Every runner test is isolated from live Codex, including failure paths.
     monkeypatch.setattr("auto_coding.integrations.codex.shutil.which", lambda name: "codex.exe")
     mock = Mock(return_value=subprocess.CompletedProcess([], 0, SUCCESS, "private stderr"))
-    monkeypatch.setattr("auto_coding.integrations.codex.subprocess.run", mock)
+    monkeypatch.setattr("auto_coding.integrations.codex._run_process", mock)
     return mock
 
 
@@ -172,3 +173,14 @@ def test_invalid_timeout_does_not_launch(tmp_path, process, timeout):
 def test_invalid_prompt_or_model_does_not_launch(tmp_path, process, prompt, model):
     assert not run_codex(prompt, model, tmp_path).success
     process.assert_not_called()
+
+
+@pytest.mark.parametrize("timed_out", [False, True])
+def test_process_safety_failure_is_reported_even_with_completed_turn(tmp_path, process, timed_out):
+    process.side_effect = ProcessSafetyError("Windows cleanup verification failed", stdout=SUCCESS,
+                                           timed_out=timed_out, exit_code=0)
+    result = run_codex("prompt", "exact-model", tmp_path)
+    assert not result.success and result.exit_code == 0
+    assert result.timed_out == timed_out
+    assert "cleanup verification failed" in result.error
+    assert result.final_response == "Done: ž"

@@ -310,3 +310,17 @@ def test_release_failure_reports_error_without_losing_persisted_status(setup, mo
     assert not result.success and "unlock failed" in result.error
     assert result.final_status == TaskStatus.READY_TO_COMMIT
     assert setup[1].get_task("TASK-A").status == TaskStatus.READY_TO_COMMIT
+
+
+@pytest.mark.parametrize("error", ["Windows containment setup failed", "Windows cleanup could not be confirmed",
+                                   "Could not launch Codex CLI", "Codex execution timed out"])
+def test_process_safety_errors_stop_tests_persist_failure_and_release_lock(setup, error):
+    setup[3].return_value = replace(setup[3].return_value, success=False, error=error,
+                                   timed_out="timed out" in error)
+    result = execute(setup)
+    assert not result.success and result.final_status == TaskStatus.FAILED
+    assert error in result.error
+    setup[3].assert_called_once()
+    setup[4].assert_not_called()
+    with setup[2].lock_factory(setup[5]):
+        pass

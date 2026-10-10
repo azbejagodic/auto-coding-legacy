@@ -6,14 +6,24 @@ from dataclasses import dataclass, field
 import json
 import logging
 import math
+import os
 from pathlib import Path
 import shutil
 import subprocess
 import time
 from typing import Any
 
+from .windows_process import ProcessSafetyError
+
 
 logger = logging.getLogger(__name__)
+
+
+def _run_process(arguments: list[str], **options) -> subprocess.CompletedProcess:
+    if os.name == "nt":
+        from .windows_process import run_contained
+        return run_contained(arguments, **options)
+    return subprocess.run(arguments, **options)
 
 
 @dataclass(frozen=True)
@@ -142,7 +152,7 @@ def run_codex(
     arguments = [executable, "exec", "--model", model, "--sandbox", "workspace-write",
                  "--json", "--color", "never", "-"]
     try:
-        completed = subprocess.run(
+        completed = _run_process(
             arguments,
             input=prompt,
             cwd=directory,
@@ -154,8 +164,10 @@ def run_codex(
             check=False,
             shell=False,
         )
+    except ProcessSafetyError as exc:
+        return result(error=str(exc), exit_code=exc.exit_code, stdout=_text(exc.stdout),
+                      stderr=_text(exc.stderr), timed_out=exc.timed_out)
     except subprocess.TimeoutExpired as exc:
-        # subprocess.run kills and waits for the direct child before raising.
         return result(error="Codex execution timed out", stdout=_text(exc.stdout),
                       stderr=_text(exc.stderr), timed_out=True)
     except OSError as exc:

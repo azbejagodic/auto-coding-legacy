@@ -102,8 +102,40 @@ malformed/error events. Unknown event types are retained. Success describes CLI
 completion only; code changes and tests still require independent verification.
 
 Expected input, launch, CLI, output, and timeout failures return unsuccessful
-results. Timeouts kill and wait for the direct CLI process; descendant process
-tree termination is not guaranteed. Output is buffered in memory until exit.
+results. On Windows 10 / Server 2016 or newer, Codex is created atomically in a
+private Windows Job Object with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`. The job
+handle is non-inheritable and only the three stdio handles are passed to Codex.
+Normal child creation inherits containment; breakaway is not enabled. No shell,
+administrator rights, or relaxed Codex sandbox flags are used. Creation-time
+assignment avoids an unprotected startup window, including controller crashes
+during process creation. Unsupported OS/job configurations fail closed; there
+is no fallback to an uncontained launch.
+
+Timeouts cover stdin writes as well as waiting for output. On completion,
+timeout, or interruption, remaining job members are terminated and the job's
+active-process count must reach zero within five seconds. Output draining and
+direct-process waiting also have bounded cleanup waits. Cleanup/verification or
+handle-close failures produce unsuccessful results even with exit code zero and
+a completed turn. A timeout remains marked `timed_out=True` when cleanup fails.
+The controller propagates these errors, skips tests, persists failure where
+possible, and does not retry. Killing the controller closes its job handle in
+the OS and terminates contained descendants without Python cleanup handlers.
+
+Containment is lifecycle management, not an additional security boundary:
+processes delegated to external services/brokers (for example WMI) are not
+ordinary job descendants. Existing outer-job/security policies may prevent
+launch; these are reported rather than bypassed. During abrupt controller death,
+OS termination is asynchronous: Python cannot verify cleanup or roll back files
+already written, and workspace-lock release is not atomic with tree termination.
+Inspect the workspace before manually recovering interrupted tasks. The Windows
+adapter uses Python 3.12 Popen internals for pipes/waiting; the application remains
+pinned to Python 3.12. See Microsoft's [job lifecycle documentation](https://learn.microsoft.com/en-us/windows/win32/procthread/job-objects)
+and [creation-time attributes](https://learn.microsoft.com/en-us/windows/win32/api/processthreadsapi/nf-processthreadsapi-updateprocthreadattribute).
+
+On non-Windows systems the existing `subprocess.run` behavior is unchanged:
+timeouts kill/wait only the direct CLI child. Descendants can survive timeouts or
+controller death; the Windows cleanup guarantees do not apply there.
+Output is buffered in memory until exit.
 The caller configures the existing logging system; the runner logs metadata
 without prompts, output, tokens, or session IDs. Returned output can contain
 private information and should be handled accordingly. Tests mock all Codex
@@ -259,6 +291,7 @@ injection via `lock_factory` permits isolated testing or a shared local location
 
 Different workspaces can run independently. Locks coordinate cooperating local
 controllers only, not unrelated editors/processes or separate computers/checkouts.
-If a controller crashes, an orphaned Codex child may continue modifying files
-after its parent's lock is released. Inspect and stop such children before
-resuming work. Process-tree cleanup and crash recovery are not implemented.
+On Windows, controller death triggers OS job cleanup for contained Codex
+descendants, subject to the limitations described above. Elsewhere, orphaned
+Codex children may continue modifying files after the lock is released; inspect
+and stop them before resuming. Crash recovery is not implemented.
