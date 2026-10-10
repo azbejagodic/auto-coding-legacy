@@ -8,3 +8,6 @@ log_directory = "logs"
 # Use relative paths or environment-specific absolute paths.
 workspace = "."
 
+[storage]
+database_path = "runtime/tasks.sqlite3"
+

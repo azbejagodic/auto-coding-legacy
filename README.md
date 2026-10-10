@@ -1,6 +1,6 @@
 # auto-coding
 
-Local foundation for the auto-coding development workflow. This task includes the package structure, read-only prerequisite diagnostics, logging, and pytest setup. Browser automation, Codex execution, GitHub automation, task storage, and the dashboard are intentionally not implemented yet.
+Local foundation for the auto-coding development workflow, with read-only prerequisite diagnostics, logging, SQLite task storage, and pytest setup. Browser automation, Codex execution, GitHub automation, and the dashboard are intentionally not implemented yet.
 
 ## Requirements
 
@@ -43,3 +43,36 @@ python -m pytest
 The optional `test` dependency installs pytest for running the test suite.
 
 Application logs are written to `logs\auto-coding.log` when the application configures logging.
+
+## Task storage
+
+`TaskStore` accepts a configurable database file path and creates its parent
+directories and schema when opened. Existing tasks are preserved on reopening.
+The example configuration's `[storage].database_path` documents the local path;
+configuration loading is not wired into the CLI. Pass the chosen path directly:
+
+```python
+from auto_coding.storage import TaskStatus, TaskStore
+
+with TaskStore("runtime/tasks.sqlite3") as store:
+    task = store.add_task(
+        task_id="TASK-EXAMPLE",
+        title="Example task",
+        prompt="Full original Codex prompt",
+        model="assigned-model",
+        task_order=1,
+        acceptance_criteria=["Tests pass"],
+    )
+    task = store.get_task(task.task_id)
+    tasks = store.list_tasks()
+    store.update_status(task.task_id, TaskStatus.RUNNING)
+```
+
+Run the example insertion only once per database: duplicate IDs raise
+`DuplicateTaskError`. Invalid statuses raise `ValueError`. A missing lookup
+returns `None`; updating a missing task raises `KeyError`. Tasks are listed by
+`task_order`, with ties sorted by ID. Statuses are `queued`, `running`,
+`awaiting_review`, `approved`, `rejected`, and `failed`; storage does not impose
+transition rules. Acceptance criteria are serialized as JSON, and timestamps
+are UTC ISO 8601 strings. Database files and SQLite sidecar files are ignored
+by Git. Use the context manager to close the connection, or call `close()`.
