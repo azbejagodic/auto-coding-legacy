@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import logging
 from pathlib import Path
 import time
@@ -11,6 +11,7 @@ from typing import Callable, Sequence
 from .integrations.codex import CodexResult, run_codex
 from .storage import TaskStatus, TaskStore
 from .test_runner import TestRunResult, run_tests, validate_test_plan
+from .workspace_lock import WorkspaceBusyError, WorkspaceLock, WorkspaceLockError
 
 
 logger = logging.getLogger(__name__)
@@ -27,6 +28,7 @@ class ExecutionResult:
     error: str | None
     duration_seconds: float
     state_uncertain: bool = False
+    workspace_busy: bool = False
 
 
 class SingleTaskController:
@@ -42,12 +44,39 @@ class SingleTaskController:
         *,
         codex_runner: Callable[..., CodexResult] = run_codex,
         test_runner: Callable[..., TestRunResult] = run_tests,
+        lock_factory: Callable[[str | Path], WorkspaceLock] = WorkspaceLock,
     ) -> None:
         self.store = store
         self.codex_runner = codex_runner
         self.test_runner = test_runner
+        self.lock_factory = lock_factory
 
     def execute(
+        self,
+        task_id: str,
+        working_directory: str | Path,
+        test_commands: Sequence[Sequence[str]],
+        *,
+        codex_timeout: float = 600.0,
+        test_timeout: float = 600.0,
+    ) -> ExecutionResult:
+        started = time.monotonic()
+        result = None
+        try:
+            with self.lock_factory(working_directory) as lock:
+                result = self._execute_locked(task_id, lock.workspace, test_commands,
+                                              codex_timeout=codex_timeout, test_timeout=test_timeout)
+        except WorkspaceLockError as exc:
+            busy = isinstance(exc, WorkspaceBusyError)
+            logger.warning("Workspace lock operation failed: busy=%s", busy)
+            if result is not None:
+                return replace(result, success=False, error=f"{result.error + '; ' if result.error else ''}{exc}",
+                               duration_seconds=time.monotonic() - started)
+            return ExecutionResult(task_id, None, None, None, None, False, str(exc),
+                                   time.monotonic() - started, workspace_busy=busy)
+        return replace(result, duration_seconds=time.monotonic() - started)
+
+    def _execute_locked(
         self,
         task_id: str,
         working_directory: str | Path,

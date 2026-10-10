@@ -11,6 +11,7 @@ from auto_coding.controller import SingleTaskController
 from auto_coding.integrations.codex import CodexResult
 from auto_coding.storage import TaskStatus, TaskStore
 from auto_coding.test_runner import CommandResult, TestRunResult as RunResult
+from auto_coding.workspace_lock import WorkspaceBusyError, WorkspaceLock, WorkspaceLockError
 
 
 @pytest.fixture
@@ -24,7 +25,8 @@ def setup(tmp_path):
         codex = Mock(return_value=CodexResult(True, "exact-model", 0, "private answer", "private output", ""))
         command = CommandResult(("tool", "test"), 0, "private tests", "", 0.1, True)
         tests = Mock(return_value=RunResult(True, (command,), None, 0.1))
-        controller = SingleTaskController(store, codex_runner=codex, test_runner=tests)
+        factory = lambda workspace: WorkspaceLock(workspace, lock_directory=tmp_path.parent / "locks")
+        controller = SingleTaskController(store, codex_runner=codex, test_runner=tests, lock_factory=factory)
         yield path, store, controller, codex, tests, tmp_path
 
 
@@ -81,7 +83,9 @@ def test_concurrent_controllers_cannot_both_execute(setup):
     barrier = Barrier(2)
     codex, tests = setup[3:5]
 
-    def worker():
+    def worker(index):
+        directory = setup[5] / str(index)
+        directory.mkdir()
         with TaskStore(path) as store:
             original = store.get_task
             first = True
@@ -95,12 +99,13 @@ def test_concurrent_controllers_cannot_both_execute(setup):
                 return task
 
             store.get_task = retrieve
-            return SingleTaskController(store, codex_runner=codex, test_runner=tests).execute(
-                "TASK-A", setup[5], [["tool", "test"]],
+            return SingleTaskController(store, codex_runner=codex, test_runner=tests,
+                                        lock_factory=setup[2].lock_factory).execute(
+                "TASK-A", directory, [["tool", "test"]],
             )
 
     with ThreadPoolExecutor(max_workers=2) as pool:
-        results = list(pool.map(lambda _: worker(), range(2)))
+        results = list(pool.map(worker, range(2)))
     assert sum(result.success for result in results) == 1
     assert any("already claimed" in (result.error or "") for result in results)
     codex.assert_called_once()
@@ -215,9 +220,93 @@ def test_interrupted_task_stays_running_and_cannot_restart(setup):
         execute(setup)
     with TaskStore(setup[0]) as reopened:
         assert reopened.get_task("TASK-A").status == TaskStatus.RUNNING
-        result = SingleTaskController(reopened, codex_runner=setup[3], test_runner=setup[4]).execute(
+        result = SingleTaskController(reopened, codex_runner=setup[3], test_runner=setup[4],
+                                      lock_factory=setup[2].lock_factory).execute(
             "TASK-A", setup[5], [["tool"]],
         )
         assert not result.success and result.final_status == TaskStatus.RUNNING
     setup[3].assert_called_once()
     setup[4].assert_not_called()
+
+
+def test_busy_workspace_leaves_both_tasks_unchanged(setup, monkeypatch):
+    store, controller = setup[1:3]
+    before = store.list_tasks()
+    claim = Mock(wraps=store.claim_task)
+    update = Mock(wraps=store.update_status)
+    monkeypatch.setattr(store, "claim_task", claim)
+    monkeypatch.setattr(store, "update_status", update)
+    with controller.lock_factory(setup[5]):
+        for task_id in ("TASK-A", "TASK-B"):
+            result = controller.execute(task_id, setup[5], [["tool", "test"]])
+            assert result.workspace_busy and not result.success
+            assert "busy" in result.error and not result.state_uncertain
+    assert store.list_tasks() == before
+    claim.assert_not_called()
+    update.assert_not_called()
+    setup[3].assert_not_called()
+    setup[4].assert_not_called()
+
+
+def test_lock_covers_claim_runners_and_final_persistence(setup, monkeypatch):
+    store, controller, codex, tests = setup[1:5]
+
+    def assert_locked():
+        with pytest.raises(WorkspaceBusyError):
+            with controller.lock_factory(setup[5]):
+                pass
+
+    original_claim, original_update = store.claim_task, store.update_status
+
+    def claim(*args):
+        assert_locked()
+        return original_claim(*args)
+
+    def update(*args):
+        assert_locked()
+        return original_update(*args)
+
+    monkeypatch.setattr(store, "claim_task", claim)
+    monkeypatch.setattr(store, "update_status", update)
+    codex.side_effect = lambda **kwargs: (assert_locked(), codex.return_value)[1]
+    tests.side_effect = lambda **kwargs: (assert_locked(), tests.return_value)[1]
+    assert execute(setup).success
+    with controller.lock_factory(setup[5]):
+        pass
+
+
+@pytest.mark.parametrize("failure", [RuntimeError, KeyboardInterrupt])
+def test_lock_released_after_runner_failure_or_interruption(setup, failure):
+    setup[3].side_effect = failure
+    if failure is KeyboardInterrupt:
+        with pytest.raises(KeyboardInterrupt):
+            execute(setup)
+    else:
+        assert not execute(setup).success
+    with setup[2].lock_factory(setup[5]):
+        pass
+
+
+def test_invalid_workspace_does_not_claim_task(setup):
+    before = setup[1].get_task("TASK-A")
+    result = setup[2].execute("TASK-A", setup[5] / "missing", [["tool"]])
+    assert not result.success and not result.workspace_busy
+    assert setup[1].get_task("TASK-A") == before
+    setup[3].assert_not_called()
+    setup[4].assert_not_called()
+
+
+def test_release_failure_reports_error_without_losing_persisted_status(setup, monkeypatch):
+    lock = setup[2].lock_factory(setup[5])
+    release = lock.release
+
+    def fail_release():
+        release()
+        raise WorkspaceLockError("Workspace lock unlock failed")
+
+    monkeypatch.setattr(lock, "release", fail_release)
+    setup[2].lock_factory = lambda workspace: lock
+    result = execute(setup)
+    assert not result.success and "unlock failed" in result.error
+    assert result.final_status == TaskStatus.READY_TO_COMMIT
+    assert setup[1].get_task("TASK-A").status == TaskStatus.READY_TO_COMMIT

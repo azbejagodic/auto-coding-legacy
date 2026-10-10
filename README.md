@@ -239,6 +239,26 @@ and test result objects, overall success, error, duration, and uncertainty flag.
 Prompts, outputs, and raw exception messages are not copied into controller logs.
 Configure logging through the existing logging setup. Inject `codex_runner` and
 `test_runner` callables into the constructor for testing. Each invocation needs
-its own `TaskStore` connection; claiming protects a task ID, not simultaneous
-execution of different tasks in the same workspace. No workspace locking or
-interruption recovery is implemented.
+its own `TaskStore` connection.
+
+Before reading or claiming a task, the controller validates the workspace and
+acquires a fail-fast OS-backed file lock for its resolved absolute path. The lock
+is held through Codex, tests, and final SQLite persistence, including failure
+updates. Contention returns `workspace_busy=True` without changing task data or
+launching either runner; model and final status are `None` because no task is read.
+Lock acquisition and release errors return unsuccessful results. A release error
+does not undo an already-persisted task status.
+
+Lock files live outside the target repository: `%LOCALAPPDATA%\auto-coding\workspace-locks`
+on Windows, `~/Library/Application Support/auto-coding/workspace-locks` on macOS,
+and `$XDG_DATA_HOME/auto-coding/workspace-locks` (default `~/.local/share`) on Linux.
+Files remain after release; only OS lock ownership indicates a busy workspace.
+The OS releases ownership when the controller exits, including abnormal exits.
+All cooperating controllers must use the same local lock directory; constructor
+injection via `lock_factory` permits isolated testing or a shared local location.
+
+Different workspaces can run independently. Locks coordinate cooperating local
+controllers only, not unrelated editors/processes or separate computers/checkouts.
+If a controller crashes, an orphaned Codex child may continue modifying files
+after its parent's lock is released. Inspect and stop such children before
+resuming work. Process-tree cleanup and crash recovery are not implemented.
