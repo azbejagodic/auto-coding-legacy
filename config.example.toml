@@ -1,0 +1,10 @@
+# Copy this file to config.toml and adjust values for your local environment.
+# Do not commit config.toml or credentials.
+
+[application]
+log_directory = "logs"
+
+[paths]
+# Use relative paths or environment-specific absolute paths.
+workspace = "."
+
