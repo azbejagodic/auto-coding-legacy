@@ -1,6 +1,6 @@
 # auto-coding
 
-Local foundation for the auto-coding development workflow, with read-only prerequisite diagnostics, logging, SQLite task storage, a single-task Codex CLI runner, and pytest setup. Browser automation, GitHub automation, and the dashboard are intentionally not implemented yet.
+Local foundation for the auto-coding development workflow, with read-only prerequisite diagnostics, logging, SQLite task storage, a single-task Codex CLI runner, explicit Git/GitHub operations, and pytest setup. Browser automation, workflow orchestration, and the dashboard are intentionally not implemented yet.
 
 ## Requirements
 
@@ -108,3 +108,48 @@ execution and do not consume model usage.
 
 Argument handling was checked against the installed CLI's `codex exec --help`.
 JSONL parsing follows the [official non-interactive mode documentation](https://developers.openai.com/codex/noninteractive).
+
+## Git integration
+
+`auto_coding.integrations.git.GitRepository(repository_path, timeout=60.0)`
+validates an existing repository root using the local Git executable. Each
+operation is explicit; constructing the object does not fetch, switch, commit,
+or push. The interface is independent of task storage and Codex:
+
+- `validate()` returns repository path, active branch, full commit SHA,
+  working-tree change status, and confirmed origin availability.
+- `active_branch()`, `current_commit_sha()`, `verify_origin()`, and
+  `has_uncommitted_changes()` provide individual checks.
+- `create_development_branch("automation/batch-001")` requires a clean tree,
+  fetches `origin/main`, creates a new branch at that commit, switches to it,
+  and verifies the result. Omit the name for a UUID-based unique batch name.
+  Existing local or remote names are rejected.
+- `commit_files(expected_branch, ["src/example.py"], "Commit message")`
+  stages only validated, explicitly selected files and returns a `GitResult`
+  with the full commit SHA. The existing index must be empty. Ignored files,
+  known credential/session paths, directories, symlinks, traversal, missing
+  files, and paths outside the repository are rejected. Deletions are not
+  supported by this initial interface. Empty commits are rejected.
+- `push_branch(expected_branch, expected_commit_sha)` requires HEAD to match,
+  pushes only that branch without force, queries origin to verify its SHA,
+  and returns a `GitResult`. Supported github.com HTTPS/SSH remotes also yield
+  a credential-free commit URL; other remotes yield `None`.
+
+Failures raise `GitError` with operation, detail, and an exit code when known.
+Authentication, network, launch, and timeout errors are reported without raw
+Git output or remote URLs that might contain credentials. Existing logging
+configuration is used; commit messages and file contents are not logged.
+
+Mutations refuse detached HEAD, protected `main`, unexpected branch state,
+or unfinished merge/rebase/cherry-pick operations. Origin must have a single
+matching fetch and push URL. Hooks and signing are disabled per invocation;
+global Git configuration is never modified. Native executables are required
+on Windows. Git authentication must already be configured locally.
+
+Callers must serialize repository access; checks do not lock out other Git
+processes. Failed staging or commits leave the index for manual inspection.
+Network timeouts can leave the remote outcome uncertain; inspect remote state
+before retrying. Credential-path checks cover known names, not secret detection
+inside arbitrary source files. Git configuration and credential/transport
+helpers are trusted local prerequisites. Tests use temporary local bare
+remotes or mocked results and never contact GitHub.
