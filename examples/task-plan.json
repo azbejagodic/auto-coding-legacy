@@ -14,7 +14,8 @@
       "dependencies": [],
       "permitted_files": ["docs/example.md"],
       "test_commands": [["python", "-m", "pytest", "tests/test_storage.py"]],
-      "approved_placeholders": ["BRANCH"]
+      "approved_placeholders": ["BRANCH"],
+      "execution_limits": {"codex_timeout": 600, "test_timeout": 120}
     },
     {
       "task_id": "EXAMPLE-002",
@@ -26,7 +27,8 @@
       "acceptance_criteria": ["docs/example.md contains a usage section."],
       "dependencies": ["EXAMPLE-001"],
       "permitted_files": ["docs/example.md"],
-      "test_commands": [["python", "-m", "pytest", "tests/test_storage.py"]]
+      "test_commands": [["python", "-m", "pytest", "tests/test_storage.py"]],
+      "execution_limits": {"codex_timeout": 600, "test_timeout": 120}
     },
     {
       "task_id": "EXAMPLE-003",
@@ -39,7 +41,8 @@
       "dependencies": ["EXAMPLE-002"],
       "permitted_files": ["docs/example.md"],
       "test_commands": [["python", "-m", "pytest", "tests/test_storage.py"]],
-      "approved_placeholders": ["LATEST_SHA"]
+      "approved_placeholders": ["LATEST_SHA"],
+      "execution_limits": {"codex_timeout": 600, "test_timeout": 120}
     }
   ]
 }

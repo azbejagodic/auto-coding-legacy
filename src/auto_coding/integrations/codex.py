@@ -18,6 +18,13 @@ from .windows_process import ProcessSafetyError
 
 logger = logging.getLogger(__name__)
 
+BATCH_GIT_POLICY = (
+    "Implement only the supplied task in the approved workspace. Python owns all "
+    "Git commits and pushes. Do not stage, commit, push, merge, switch branches, "
+    "rewrite Git history, or modify Git configuration. Do not execute test commands; "
+    "Python runs the approved tests after you finish. Do not start other tasks."
+)
+
 
 def _run_process(arguments: list[str], **options) -> subprocess.CompletedProcess:
     if os.name == "nt":
@@ -101,6 +108,9 @@ def run_codex(
     model: str,
     working_directory: str | Path,
     timeout: float = 600.0,
+    *,
+    reasoning_effort: str | None = None,
+    controller_owned_git: bool = False,
 ) -> CodexResult:
     """Run one non-interactive task with workspace-write permissions.
 
@@ -136,6 +146,8 @@ def run_codex(
         return result(error="Model must be a nonempty identifier without NUL characters")
     if isinstance(timeout, bool) or not isinstance(timeout, (int, float)) or not math.isfinite(timeout) or timeout <= 0:
         return result(error="Timeout must be a finite positive number of seconds")
+    if reasoning_effort is not None and reasoning_effort not in ("minimal", "low", "medium", "high", "xhigh"):
+        return result(error="Unsupported reasoning effort")
     try:
         directory = Path(working_directory).resolve()
         if not directory.is_dir():
@@ -151,6 +163,14 @@ def run_codex(
         return result(error="Codex resolves to a Windows batch shim; put the native codex.exe on PATH")
     arguments = [executable, "exec", "--model", model, "--sandbox", "workspace-write",
                  "--json", "--color", "never", "-"]
+    overrides = []
+    if reasoning_effort is not None:
+        overrides += ["--config", "model_reasoning_effort=" + json.dumps(reasoning_effort)]
+    if controller_owned_git:
+        # TOML basic strings accept this ASCII JSON string encoding. Keep stdin
+        # exactly the approved prompt (with only approved placeholders resolved).
+        overrides += ["--config", "developer_instructions=" + json.dumps(BATCH_GIT_POLICY)]
+    arguments[-1:-1] = overrides
     try:
         completed = _run_process(
             arguments,

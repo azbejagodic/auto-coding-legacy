@@ -10,6 +10,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 import hashlib
 import json
+import math
 from pathlib import Path
 import re
 from typing import Any
@@ -146,7 +147,7 @@ def validate_plan(data: Any) -> FrozenPlan:
     previous_order = 0
     for index, task in enumerate(tasks):
         location = f"tasks[{index}]"
-        _fields(task, required, {"approved_placeholders"}, location)
+        _fields(task, required, {"approved_placeholders", "execution_limits"}, location)
         identity = _identifier(task["task_id"], location + ".task_id")
         if identity in positions:
             _error(location, "duplicate task ID")
@@ -183,6 +184,13 @@ def validate_plan(data: Any) -> FrozenPlan:
                     _error(location + ".test_commands", "placeholders are supported only in prompts")
         approved = _strings(task.get("approved_placeholders", []), location + ".approved_placeholders")
         _placeholders(task["prompt"], approved, location + ".approved_placeholders")
+        if "execution_limits" in task:
+            limits = task["execution_limits"]
+            _fields(limits, {"codex_timeout", "test_timeout"}, set(), location + ".execution_limits")
+            for value in limits.values():
+                if (isinstance(value, bool) or not isinstance(value, (int, float))
+                        or not 0 < value <= 86400 or not math.isfinite(value)):
+                    _error(location + ".execution_limits", "timeouts must be finite seconds in (0, 86400]")
     try:
         canonical = json.dumps(data, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
         canonical.encode("utf-8")

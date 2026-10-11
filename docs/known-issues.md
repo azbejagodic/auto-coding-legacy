@@ -2,8 +2,8 @@
 
 ## Quick reviewer boundaries (TASK-010)
 
-The Groq reviewer is standalone; no automatic review loop or task-status
-approval is connected. Caller-owned Python test provenance is trusted, not
+The Groq reviewer is now connected by the approved batch controller.
+Caller-owned Python test provenance is trusted, not
 cryptographically verified or recovered after restart. Missing evidence fails
 closed. Root and ordinary single-parent commits are supported; merge commits,
 binary/non-UTF-8/non-regular files, mode-only evidence, huge individual hunks and
@@ -14,16 +14,26 @@ reject harmless examples; SQLite is private local storage, not encryption.
 Usage is an application estimate, not exact account quota. The opt-in live smoke
 check was not run during implementation. See [review documentation](groq-reviews.md).
 
-## Frozen plan execution is not connected (TASK-009)
+## Approved batch recovery boundaries (TASK-011)
 
-Plans validate/import offline, but the current controller does not enforce all
-frozen fields. Imported tasks therefore cannot be claimed for execution; a future
-approved task must add plan-aware enforcement and placeholder resolution first.
+Plans validate/import offline; explicit approved execution now enforces frozen
+fields and Groq approval under the existing lock. Historical plans without
+explicit execution limits cannot run; approve a new identity with those limits.
+Any unfinished execution stops for manual inspection, rather than resuming
+Codex, committing, pushing or reviewing again. Only a consistent finalized prefix
+can resume automatically. A crash between Git and SQLite can leave a commit only
+in Git; checkpoints and HEAD/reflog need manual reconciliation. No atomic
+transaction spans Git, SQLite, remote pushes and provider requests.
 Statuses and commit records may still be updated independently. Model/reasoning
 compatibility, executable availability and real filesystem/symlink containment
 are not checked by the offline validator. Human approval must cover command
 semantics and sensitive prompt content. Fingerprints are not signatures and
-SQLite is not encrypted. See [task plans](task-plans.md).
+SQLite is not encrypted. The controller cannot enforce developer instructions as
+an OS security boundary: Codex must not commit/push, and unexpected Git state
+stops execution, but approved local programs and local Git/auth configuration
+remain trusted. Review budget limits can stop large prompts or single hunks even
+when chunking is enabled. No real unattended batch or live review was run during
+implementation. See [batch execution](batch-execution.md) and [task plans](task-plans.md).
 
 ## Existing lock-termination test with Windows venv redirectors
 

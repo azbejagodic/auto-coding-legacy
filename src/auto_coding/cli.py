@@ -24,6 +24,21 @@ def build_parser() -> argparse.ArgumentParser:
     importer.add_argument("path")
     importer.add_argument("--db", required=True)
     importer.add_argument("--approve", action="store_true", help="explicitly approve this exact local plan")
+    batch = subparsers.add_parser("batch", help="inspect or explicitly execute approved batches")
+    batches = batch.add_subparsers(dest="batch_command", required=True)
+    status = batches.add_parser("status", help="read-only local batch status; no model calls")
+    status.add_argument("--db", required=True)
+    status.add_argument("--batch")
+    run = batches.add_parser("run", help="execute a frozen batch (real model usage, commits and pushes)")
+    run.add_argument("batch_id")
+    run.add_argument("--db", required=True)
+    run.add_argument("--repo", required=True)
+    run.add_argument("--max-tasks", type=int)
+    run.add_argument("--review-budget", type=int, default=12000,
+                     help="conservative per-request wire budget including reserved output")
+    run.add_argument("--review-token-limit", type=int, default=30000,
+                     help="maximum conservative total budget per review")
+    run.add_argument("--execute", action="store_true", help="explicitly authorize real execution")
     return parser
 
 
@@ -52,6 +67,58 @@ def main(argv: list[str] | None = None) -> int:
         except (OSError, sqlite3.Error):
             print("Plan database operation failed; no batch was imported.", file=sys.stderr)
         return 1
+
+    if args.command == "batch":
+        if args.batch_command == "run" and not args.execute:
+            print("Execution requires --execute; no task was started.", file=sys.stderr)
+            return 1
+        try:
+            if args.batch_command == "status":
+                with TaskStore(args.db, read_only=True) as store:
+                    plans = [store.get_plan(args.batch)] if args.batch else store.list_plans()
+                    if any(plan is None for plan in plans):
+                        raise ValueError("Approved batch not found")
+                    for plan in plans:
+                        print(f"Batch {plan.batch_id}: {plan.task_count} tasks; SHA-256 {plan.fingerprint}")
+                        store.validate_plan_tasks(plan)
+                        tasks = store.list_plan_tasks(plan.batch_id)
+                        completed = [task.task_id for task in tasks if task.status == "approved"]
+                        active = [task.task_id for task in tasks if task.status not in ("queued", "approved")]
+                        print(f"  Current/stopped={active[0] if active else '-'}; "
+                              f"last completed={completed[-1] if completed else '-'}")
+                        for task in tasks:
+                            execution = store.executions.get(task.task_id) or {}
+                            commit = store.get_commit(task.task_id)
+                            review = (store.reviews.get(execution["review_id"]) or {}
+                                      if execution.get("review_id") else {})
+                            print(f"  {task.task_id}: {task.status}; stage={execution.get('stage', 'not_started')}; "
+                                  f"SHA={commit.commit_sha if commit else '-'}; review={review.get('decision', '-')}")
+                            if execution.get("recovery_required") and execution:
+                                print(f"    Inspection required; last/failing stage="
+                                      f"{execution.get('failure_stage') or execution.get('stage')}")
+                                if execution.get("error"):
+                                    print(f"    {execution['error']}")
+                return 0
+            from .batch_controller import BatchController
+            from .reviews import ReviewConfig
+            config = ReviewConfig(request_budget=args.review_budget, max_review_tokens=args.review_token_limit)
+            with TaskStore(args.db) as store:
+                result = BatchController(store, review_config=config).run(
+                    args.batch_id, args.repo, max_tasks=args.max_tasks
+                )
+            print(f"Batch {result.batch_id}: {'completed' if result.completed else 'stopped'}; "
+                  f"successful tasks this run={result.successful_tasks}; current={result.current_task or '-'}; "
+                  f"last completed={result.last_completed_task or '-'}; SHA={result.commit_sha or '-'}; "
+                  f"review={result.review_status or '-'}; stage={result.stopped_stage or '-'}")
+            if result.error:
+                print(result.error, file=sys.stderr)
+            return 0 if result.success else 1
+        except KeyboardInterrupt:
+            print("Interrupted; inspect batch status and workspace before recovery.", file=sys.stderr)
+            return 130
+        except (ValueError, OSError, sqlite3.Error):
+            print("Batch operation failed; check database identity, integrity and permissions.", file=sys.stderr)
+            return 1
 
     configure_logging()
     build_parser().print_help()

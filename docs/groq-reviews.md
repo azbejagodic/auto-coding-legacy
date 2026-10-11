@@ -3,7 +3,9 @@
 This component checks one approved task/commit, not a complete architecture.
 It does not call Codex, run tests, change files, approve task status, retry a
 review, switch providers, configure billing, push, or control execution.
-TASK-011 integration is deliberately absent; frozen-plan execution remains blocked.
+TASK-011's [approved batch controller](batch-execution.md) calls this reviewer and
+owns task-status finalization after independently verified complete approval.
+The reviewer itself still makes no execution or task-state decisions.
 
 ## Installation and private credentials
 

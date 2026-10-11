@@ -1,6 +1,10 @@
 # auto-coding
 
-Local auto-coding foundation with read-only diagnostics, SQLite task storage and frozen plans, Codex CLI execution, approved tests, and a locked single-task commit/push controller. A standalone Groq quick reviewer now supports bounded diff chunks and private local review history. It is not connected to automatic task execution. Browser automation, automatic multi-task scheduling, pull requests, and the dashboard are not implemented.
+Local auto-coding controller with read-only diagnostics, frozen SQLite task plans,
+contained Codex/tests, safe Git commit/verified push and Groq review gating.
+Explicitly approved batches execute sequentially with durable checkpoints.
+Browser automation, automatic repairs, scheduling, pull requests and the dashboard
+are not implemented. Changes are never automatically merged.
 
 ## Requirements
 
@@ -53,7 +57,7 @@ Application logs are written to `logs\auto-coding.log` when the application conf
 
 Installation includes the official `groq` SDK. Normal installation, diagnostics,
 plan imports and pytest do not make AI requests. Real reviews require a privately
-configured `GROQ_API_KEY` and an explicit programmatic invocation.
+configured `GROQ_API_KEY` and an explicit programmatic review or approved batch run.
 
 Defaults: `openai/gpt-oss-120b`, `medium` reasoning, 45-second timeout, zero retries.
 The reviewer collects actual Git changes, checks full task/SHA binding and
@@ -75,10 +79,27 @@ python -m auto_coding plan import examples/task-plan.json --db runtime/tasks.sql
 Validation is read-only. Import freezes all original task definitions and a
 deterministic SHA-256 fingerprint in one SQLite transaction, without running
 Codex, tests, Git or APIs. Batch/task collisions are rejected, including identical
-reimports. Imported tasks cannot be claimed by the legacy controller: enforcement
-of frozen scopes, tests, dependencies, reasoning effort and placeholders belongs
-to a future plan-aware execution task. Existing manually added tasks are unchanged.
+reimports. Imported tasks cannot be claimed by the legacy controller; use the
+plan-aware batch controller to enforce frozen scopes, tests, dependencies,
+reasoning effort, limits and placeholders. Existing manually added tasks are unchanged.
 See the [versioned format and three-task example](docs/task-plans.md).
+
+## Approved batch execution
+
+Inspect without AI calls, then later explicitly authorize one successful task
+in a disposable repository configured for the plan's branch and GitHub origin:
+
+```powershell
+python -m auto_coding batch status --db runtime/tasks.sqlite3 --batch EXAMPLE-BATCH-001
+python -m auto_coding batch run EXAMPLE-BATCH-001 --db runtime/tasks.sqlite3 --repo path/to/disposable-repo --max-tasks 1 --execute
+```
+
+The run command consumes model usage and commits/pushes; private `GROQ_API_KEY`
+and existing Codex/Git authentication must be configured first. Importing a plan
+does not start it. Every task needs frozen `execution_limits`. A failed,
+rejected, uncertain or interrupted task stops the batch without retries.
+Read [setup, controlled runs, status and safe recovery](docs/batch-execution.md)
+before execution. No real batch is run by the offline pytest suite.
 
 ## Task storage
 
@@ -404,4 +425,5 @@ On Windows, controller death triggers OS job cleanup for contained Codex and tes
 descendants, subject to the limitations described above. During normal execution,
 the test runner confirms job emptiness before returning to the locked controller.
 Elsewhere, orphaned Codex/test children may continue modifying files after the lock
-is released; inspect and stop them before resuming. Crash recovery is not implemented.
+is released; inspect and stop them before resuming. The batch controller resumes
+only verified finalized prefixes; incomplete stages require manual recovery.

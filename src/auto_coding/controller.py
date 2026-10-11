@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 import logging
 from pathlib import Path
 import time
@@ -10,6 +10,7 @@ from typing import Callable, Sequence
 
 from .integrations.codex import CodexResult, run_codex
 from .integrations.git import GitError, GitRepository, RepositoryState
+from .plans import FrozenPlan
 from .storage import PushState, TaskStatus, TaskStore
 from .test_runner import TestRunResult, run_tests, validate_test_plan
 from .workspace_lock import WorkspaceBusyError, WorkspaceLock, WorkspaceLockError
@@ -111,6 +112,9 @@ class SingleTaskController:
         expected_origin: str,
         expected_branch: str,
         allowed_files: Sequence[str | Path],
+        plan: FrozenPlan | None = None,
+        resolved_prompt: str | None = None,
+        checkpoint: Callable[[str, dict], None] | None = None,
     ) -> ExecutionResult:
         started = time.monotonic()
         model = None
@@ -122,6 +126,10 @@ class SingleTaskController:
         github_commit_url = None
         push_verified = False
         logger.info("Single task execution start: task_id=%r", task_id)
+
+        def progress(stage: str, **details) -> None:
+            if checkpoint is not None:
+                checkpoint(stage, details)
 
         def finish(error: str | None = None, *, uncertain: bool = False) -> ExecutionResult:
             duration = time.monotonic() - started
@@ -175,7 +183,8 @@ class SingleTaskController:
         if status != TaskStatus.QUEUED:
             return finish("Only a queued task may be executed; manual recovery is required for interrupted tasks")
         try:
-            claimed = self.store.claim_task(task_id)
+            claimed = (self.store.claim_task(task_id) if plan is None else
+                       self.store.claim_plan_task(plan, task_id, baseline.commit_sha))
         except Exception as exc:
             status = None
             return finish(f"Could not claim task ({type(exc).__name__}); task state is uncertain", uncertain=True)
@@ -196,20 +205,49 @@ class SingleTaskController:
         except ValueError as exc:
             return fail(f"Invalid test configuration: {exc}")
         try:
-            codex = self.codex_runner(prompt=task.prompt, model=task.model,
-                                      working_directory=directory, timeout=codex_timeout)
+            options = {}
+            if plan is not None:
+                definition = next(item for item in plan.to_dict()["tasks"] if item["task_id"] == task_id)
+                options = {"reasoning_effort": definition["reasoning_effort"], "controller_owned_git": True}
+            progress("codex_started")
+            codex = self.codex_runner(prompt=task.prompt if plan is None else resolved_prompt, model=task.model,
+                                      working_directory=directory, timeout=codex_timeout, **options)
+            progress("codex_finished", codex={
+                "success": codex.success, "model": codex.model, "exit_code": codex.exit_code,
+                "timed_out": codex.timed_out, "duration_seconds": codex.duration_seconds,
+                "error": "Codex failed" if codex.error else None,
+            })
         except Exception as exc:
             return fail(f"Codex runner raised {type(exc).__name__}")
-        if not codex.success or codex.timed_out or codex.exit_code != 0:
+        if (not codex.success or codex.timed_out or codex.exit_code != 0
+                or (plan is not None and (codex.error or codex.model != task.model))):
             return fail(f"Codex execution failed: {codex.error or 'unsuccessful CLI execution'}")
         try:
+            snapshot = None
+            if plan is not None:
+                repository.changed_files(expected_branch, baseline.commit_sha, allowed_files, expected_origin)
+                snapshot = repository.task_snapshot(expected_branch, baseline.commit_sha,
+                                                    allowed_files, expected_origin)
+            progress("tests_started")
             tests = self.test_runner(working_directory=directory, commands=approved, timeout=test_timeout)
+            progress("tests_completed", tests=asdict(tests))
+        except GitError as exc:
+            return fail(f"Pre-test Git safety verification failed: {exc}")
         except Exception as exc:
             return fail(f"Test runner raised {type(exc).__name__}")
         if (not tests.success or tests.commands_executed != len(approved)
                 or any(not item.success or item.exit_code != 0 or item.timed_out
-                       or item.error or item.cleanup_error for item in tests.commands)):
+                       or item.error or item.cleanup_error for item in tests.commands)
+                or (plan is not None and (tests.error or tests.failed_command
+                    or tuple(item.arguments for item in tests.commands) != approved))):
             return fail(f"Required tests failed: {tests.error or 'not all required commands passed'}")
+        if plan is not None:
+            try:
+                if snapshot != repository.task_snapshot(expected_branch, baseline.commit_sha,
+                                                        allowed_files, expected_origin):
+                    return fail("Approved source files changed during tests; tested snapshot is uncertain")
+            except GitError as exc:
+                return fail(str(exc))
         try:
             self.store.update_status(task_id, TaskStatus.READY_TO_COMMIT)
         except Exception as exc:
@@ -217,6 +255,7 @@ class SingleTaskController:
         status = TaskStatus.READY_TO_COMMIT
         try:
             files = repository.changed_files(expected_branch, baseline.commit_sha, allowed_files, expected_origin)
+            progress("commit_started")
             committed = repository.commit_files(expected_branch, files, f"{task.task_id}: {task.title}",
                                                  expected_base_sha=baseline.commit_sha)
             commit_sha, branch = committed.commit_sha, committed.branch
@@ -225,11 +264,13 @@ class SingleTaskController:
             return fail(f"Git commit failed: {detail}")
         try:
             self.store.record_commit(task_id, commit_sha, branch, None)
+            progress("commit_created", local_sha=commit_sha)
         except Exception as exc:
             return fail(f"Could not persist local commit ({type(exc).__name__}); commit remains in Git",
                         uncertain=True)
         try:
-            if not committed.success or branch != expected_branch or commit_sha == baseline.commit_sha:
+            if (not committed.success or branch != expected_branch or commit_sha == baseline.commit_sha
+                    or (plan is not None and len(commit_sha) != 40)):
                 return fail("Commit result could not be verified", uncertain=True)
             if repository.has_uncommitted_changes():
                 return fail("Unexpected changes remain after commit; commit retained without pushing", uncertain=True)
@@ -241,6 +282,7 @@ class SingleTaskController:
             return fail(f"Git commit metadata failed: {detail}")
         try:
             self.store.mark_push_attempted(task_id, github_commit_url)
+            progress("push_started")
         except Exception as exc:
             return fail(f"Could not persist local commit/push intent ({type(exc).__name__}); commit remains in Git",
                         uncertain=True)
@@ -258,6 +300,7 @@ class SingleTaskController:
             return fail(f"Git push/verification failed: {detail}; remote outcome is uncertain", uncertain=True)
         try:
             self.store.complete_push(task_id, commit_sha, branch, github_commit_url)
+            progress("push_verified", remote_sha=commit_sha)
         except Exception as exc:
             return fail(f"Push verified but final persistence failed ({type(exc).__name__}); manual recovery required",
                         uncertain=True)

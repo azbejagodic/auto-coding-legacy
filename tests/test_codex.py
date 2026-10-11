@@ -66,6 +66,29 @@ def test_missing_executable(tmp_path, process, monkeypatch):
     process.assert_not_called()
 
 
+def test_batch_reasoning_and_git_policy_preserve_stdin(tmp_path, process):
+    from auto_coding.integrations.codex import BATCH_GIT_POLICY
+    import tomllib
+
+    prompt = "Original task; do not rewrite me."
+    result = run_codex(prompt, "exact-model", tmp_path, reasoning_effort="high", controller_owned_git=True)
+    assert result.success
+    argv = process.call_args.args[0]
+    assert argv[argv.index("--model") + 1] == "exact-model"
+    assert argv[argv.index("--sandbox") + 1] == "workspace-write" and argv[-1] == "-"
+    configs = [argv[index + 1] for index, arg in enumerate(argv) if arg == "--config"]
+    assert tomllib.loads("\n".join(configs)) == {
+        "model_reasoning_effort": "high", "developer_instructions": BATCH_GIT_POLICY,
+    }
+    assert process.call_args.kwargs["input"] == prompt
+    assert process.call_args.kwargs["shell"] is False
+
+
+def test_invalid_reasoning_never_launches(tmp_path, process):
+    assert not run_codex("prompt", "model", tmp_path, reasoning_effort='high";unsafe').success
+    process.assert_not_called()
+
+
 def test_windows_batch_shim_is_rejected(tmp_path, process, monkeypatch):
     monkeypatch.setattr("auto_coding.integrations.codex.shutil.which", lambda name: "codex.cmd")
     result = run_codex("prompt", "model & command", tmp_path)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import hashlib
 import logging
 import math
 import os
@@ -410,6 +411,49 @@ class GitRepository:
             raise GitError("commit", "Commit did not advance HEAD")
         logger.info("Development commit created: branch=%r sha=%s", expected_branch, sha)
         return GitResult(self.path, expected_branch, sha)
+
+    def task_snapshot(self, expected_branch: str, base_sha: str,
+                      allowed_files: Sequence[str | Path], expected_origin: str) -> str:
+        """Bind tests to actual approved bytes; ignored runtime artifacts do not count."""
+        files = self.changed_files(expected_branch, base_sha, allowed_files, expected_origin)
+        digest = hashlib.sha256()
+        for path in sorted(self._selected_paths(allowed_files, allow_missing=True)):
+            digest.update(path.encode("utf-8") + b"\0")
+            target = self.path / path
+            if target.exists():
+                data = target.read_bytes()
+                digest.update(b"file\0" + str(len(data)).encode("ascii") + b"\0" + data)
+            else:
+                digest.update(b"missing\0")
+        digest.update("\0".join(sorted(files)).encode("utf-8"))
+        return digest.hexdigest()
+
+    def verify_remote_commit(self, expected_branch: str, expected_sha: str, expected_origin: str) -> None:
+        """Read-only reconciliation: never push again to find out what happened."""
+        self._expect_branch(expected_branch)
+        self._check_operation_state()
+        if (self.verify_origin() != expected_origin or self.current_commit_sha() != expected_sha
+                or self.has_uncommitted_changes()):
+            raise GitError("reconcile", "Local branch, origin, HEAD or workspace differs from verified state")
+        rows = [line.split() for line in self._run(
+            "ls-remote", "--exit-code", "--heads", "origin", f"refs/heads/{expected_branch}"
+        ).stdout.splitlines()]
+        if rows != [[expected_sha, f"refs/heads/{expected_branch}"]]:
+            raise GitError("reconcile", "Remote SHA differs; manual inspection required")
+        if (self.current_commit_sha() != expected_sha or self.verify_origin() != expected_origin
+                or self.has_uncommitted_changes()):
+            raise GitError("reconcile", "Repository changed during remote verification")
+        self._expect_branch(expected_branch)
+
+    def verify_linear_history(self, base_sha: str, commits: Sequence[str]) -> None:
+        parent = self._sha(base_sha)
+        for sha in commits:
+            if self._run("--no-replace-objects", "rev-list", "--parents", "-n", "1",
+                         self._sha(sha)).stdout.split() != [sha, parent]:
+                raise GitError("reconcile", "Saved task commits do not form the expected history")
+            parent = sha
+        if self.current_commit_sha() != parent:
+            raise GitError("reconcile", "HEAD differs from the last finalized task")
 
     def push_branch(self, expected_branch: str, expected_commit_sha: str) -> GitResult:
         self._expect_branch(expected_branch)

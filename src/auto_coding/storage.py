@@ -15,6 +15,7 @@ from .plans import (
     FrozenPlan, PlanConflictError, PlanExecutionUnavailableError, validate_plan,
 )
 from .review_history import ReviewHistory, initialize_review_schema
+from .batch_history import BatchHistory, initialize_batch_schema
 
 
 class TaskStatus(StrEnum):
@@ -93,8 +94,14 @@ class TaskStore:
     KeyError. Equal task orders are listed deterministically by task ID.
     """
 
-    def __init__(self, database_path: str | Path) -> None:
+    def __init__(self, database_path: str | Path, *, read_only: bool = False) -> None:
         path = Path(database_path)
+        if read_only:
+            self._connection = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+            self._connection.row_factory = sqlite3.Row
+            self.reviews = ReviewHistory(self._connection)
+            self.executions = BatchHistory(self._connection)
+            return
         path.parent.mkdir(parents=True, exist_ok=True)
         self._connection = sqlite3.connect(path)
         self._connection.row_factory = sqlite3.Row
@@ -144,10 +151,12 @@ class TaskStore:
                 """)
                 _initialize_plan_schema(self._connection)
                 initialize_review_schema(self._connection)
+                initialize_batch_schema(self._connection)
         except Exception:
             self._connection.close()
             raise
         self.reviews = ReviewHistory(self._connection)
+        self.executions = BatchHistory(self._connection)
 
     def __enter__(self) -> TaskStore:
         return self
@@ -279,14 +288,139 @@ class TaskStore:
 
     def get_plan(self, batch_id: str) -> FrozenPlan | None:
         row = self._connection.execute(
-            "SELECT definition_json, fingerprint FROM task_plans WHERE batch_id = ?", (batch_id,)
+            "SELECT * FROM task_plans WHERE batch_id = ?", (batch_id,)
         ).fetchone()
         if row is None:
             return None
         plan = validate_plan(FrozenPlan(row["definition_json"]).to_dict())
-        if plan.fingerprint != row["fingerprint"] or plan.canonical_json != row["definition_json"]:
+        definition = plan.to_dict()
+        if (plan.fingerprint != row["fingerprint"] or plan.canonical_json != row["definition_json"]
+                or definition["batch_id"] != batch_id or definition["expected_branch"] != row["expected_branch"]
+                or definition["schema_version"] != row["schema_version"] or plan.task_count != row["task_count"]):
             raise ValueError("Stored frozen plan integrity check failed")
         return plan
+
+    def list_plans(self) -> list[FrozenPlan]:
+        return [self.get_plan(row["batch_id"]) for row in self._connection.execute(
+            "SELECT batch_id FROM task_plans ORDER BY imported_at, batch_id"
+        ).fetchall()]
+
+    def validate_plan_tasks(self, plan: FrozenPlan) -> None:
+        """Check materialized tasks AND membership, not merely canonical JSON."""
+        definitions = plan.to_dict()["tasks"]
+        tasks = self.list_plan_tasks(plan.batch_id)
+        if len(tasks) != len(definitions):
+            raise ValueError("Frozen task membership differs from plan")
+        for task, definition in zip(tasks, definitions):
+            if any(getattr(task, key) != definition[key] for key in (
+                "task_id", "title", "prompt", "model", "task_order", "acceptance_criteria"
+            )):
+                raise ValueError("Stored task differs from frozen definition")
+            membership = self._connection.execute(
+                "SELECT task_order FROM plan_tasks WHERE task_id = ?", (task.task_id,)
+            ).fetchone()
+            if membership["task_order"] != definition["task_order"]:
+                raise ValueError("Stored task order differs from frozen definition")
+
+    def bind_batch(self, plan: FrozenPlan, workspace: str, origin: str, initial_sha: str) -> dict:
+        with self._connection:
+            self._connection.execute("BEGIN IMMEDIATE")
+            if self.get_plan(plan.batch_id) != plan:
+                raise ValueError("Frozen batch changed")
+            binding = self.executions.binding(plan.batch_id)
+            if binding:
+                if any(binding[key] != value for key, value in (
+                    ("fingerprint", plan.fingerprint), ("workspace", workspace), ("origin", origin)
+                )):
+                    raise ValueError("Batch is bound to a different workspace or origin")
+            else:
+                self._connection.execute("INSERT INTO batch_workspaces VALUES (?, ?, ?, ?, ?)",
+                                         (plan.batch_id, plan.fingerprint, workspace, origin, initial_sha))
+        return self.executions.binding(plan.batch_id)
+
+    def claim_plan_task(self, plan: FrozenPlan, task_id: str, baseline_sha: str) -> bool:
+        """Atomic frozen-plan claim + durable intent; legacy claims stay blocked."""
+        with self._connection:
+            self._connection.execute("BEGIN IMMEDIATE")
+            binding = self.executions.binding(plan.batch_id)
+            if (self.get_plan(plan.batch_id) != plan or not binding
+                    or binding["fingerprint"] != plan.fingerprint):
+                raise ValueError("Approved batch identity or workspace binding is missing")
+            self.validate_plan_tasks(plan)
+            definitions = plan.to_dict()["tasks"]
+            index = next(i for i, task in enumerate(definitions) if task["task_id"] == task_id)
+            definition = definitions[index]
+            if "execution_limits" not in definition:
+                raise ValueError("Frozen execution limits are required")
+            expected_sha = binding["initial_sha"]
+            # Strict sequence is stronger than just the explicitly listed dependencies.
+            for earlier in definitions[:index]:
+                execution = self.executions.get(earlier["task_id"])
+                commit = self.get_commit(earlier["task_id"])
+                if (self.get_task(earlier["task_id"]).status != TaskStatus.APPROVED
+                        or not execution or execution["stage"] != "finalized"
+                        or not commit or commit.push_state != PushState.VERIFIED
+                        or execution["baseline_sha"] != expected_sha
+                        or execution.get("remote_sha") != commit.commit_sha
+                        or execution.get("local_sha") != commit.commit_sha):
+                    raise ValueError("Earlier tasks must be durably approved")
+                expected_sha = commit.commit_sha
+            if baseline_sha != expected_sha or not re.fullmatch(r"[0-9a-f]{40}", baseline_sha):
+                raise ValueError("Task baseline differs from the approved execution history")
+            if self.executions.get(task_id) or self.get_commit(task_id):
+                return False
+            cursor = self._connection.execute(
+                "UPDATE tasks SET status = ?, updated_at = ? WHERE task_id = ? AND status = ?",
+                (TaskStatus.RUNNING, _timestamp(), task_id, TaskStatus.QUEUED),
+            )
+            if cursor.rowcount != 1:
+                return False
+            timestamp = _timestamp()
+            record = {
+                "batch_id": plan.batch_id, "task_id": task_id, "fingerprint": plan.fingerprint,
+                "model": definition["model"], "reasoning_effort": definition["reasoning_effort"],
+                "execution_limits": definition["execution_limits"], "baseline_sha": baseline_sha,
+                "stage": "claimed", "started_at": timestamp, "updated_at": timestamp,
+                "recovery_required": True,
+                "checkpoints": [{"stage": "claimed", "at": timestamp}],
+            }
+            self._connection.execute("INSERT INTO task_executions VALUES (?, ?, ?)",
+                                     (task_id, plan.batch_id, json.dumps(record)))
+        return True
+
+    def finalize_plan_task(self, task_id: str, review_id: str, *, approved: bool) -> None:
+        """Caller verifies authoritative review/Git evidence before finalization."""
+        with self._connection:
+            self._connection.execute("BEGIN IMMEDIATE")
+            execution = self.executions.get(task_id)
+            commit = self.get_commit(task_id)
+            frozen = self.get_task_plan(task_id)
+            if (not execution or execution["stage"] != "review_finished"
+                    or execution.get("review_id") != review_id
+                    or not commit or commit.push_state != PushState.VERIFIED
+                    or execution.get("remote_sha") != commit.commit_sha
+                    or execution.get("local_sha") != commit.commit_sha
+                    or not frozen or execution["fingerprint"] != frozen[0].fingerprint):
+                raise ValueError("Execution is not ready for finalization")
+            self.validate_plan_tasks(frozen[0])
+            review = self.reviews.get(review_id)
+            expected = "APPROVED" if approved else "REJECTED"
+            if (not review or review["task_id"] != task_id or review["commit_sha"] != commit.commit_sha
+                    or review["decision"] != expected
+                    or (approved and (review.get("error") or review.get("coverage_complete") is not True))):
+                raise ValueError("Durable review differs from finalization")
+            cursor = self._connection.execute(
+                "UPDATE tasks SET status = ?, updated_at = ? WHERE task_id = ? AND status = ?",
+                (TaskStatus.APPROVED if approved else TaskStatus.REJECTED, _timestamp(),
+                 task_id, TaskStatus.AWAITING_REVIEW),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("Task state changed during review")
+            self.executions._checkpoint(task_id, "finalized" if approved else "stopped", {
+                "ended_at": _timestamp(), "failure_stage": None if approved else "review",
+                "error": None if approved else "Groq rejected the commit",
+                "recovery_required": not approved,
+            })
 
     def get_task_plan(self, task_id: str) -> tuple[FrozenPlan, dict] | None:
         """Return the integrity-checked frozen definition, if this is a plan task."""

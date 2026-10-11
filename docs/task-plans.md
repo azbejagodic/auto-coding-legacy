@@ -56,6 +56,7 @@ Task fields:
 | `permitted_files` | Required nonempty array of unique explicit repository-relative file paths |
 | `test_commands` | Required nonempty array of nonempty argument arrays, e.g. `[["python", "-m", "pytest"]]` |
 | `approved_placeholders` | Optional array of unique approved names: `"BRANCH"` and/or `"LATEST_SHA"`; omitted means none approved |
+| `execution_limits` | Optional for historical import, required for batch execution: object containing positive finite `codex_timeout` and `test_timeout` seconds, each at most 86400 |
 
 Dependencies cannot be external, missing, self-referential, forward-referencing
 or circular. Nothing is sorted, deduplicated, trimmed, expanded or rewritten to
@@ -123,14 +124,15 @@ Runtime databases remain excluded from Git. Do not put API keys in plans.
 
 ## Execution boundary
 
-This task does **not** connect plans to execution. Imported tasks are queued,
-but `claim_task` raises `PlanExecutionUnavailableError` for plan members.
+Imported tasks are queued, but legacy `claim_task` still raises
+`PlanExecutionUnavailableError` for plan members.
 Consequently the legacy single-task controller cannot silently ignore their
 reasoning effort, dependencies, frozen tests/scope or unresolved placeholders.
 No task status is changed by that refusal. Existing manually added tasks,
 controller safeguards, Git operations, locks and process containment are unchanged.
 Manual status changes do not enable imported-task execution.
 
-A separately approved plan-aware controller must enforce those fields and
-placeholder resolution before execution is enabled. No multi-task loop, reviewer,
-API, Gemini integration or PR automation is implemented here.
+TASK-011's [approved batch controller](batch-execution.md) enforces these fields,
+explicit execution limits, placeholders and durable review gating. Start it only
+with an explicit `batch run ... --execute` action. Validation/import remain
+offline. Gemini, browser integration, automatic repairs and PR automation are absent.
