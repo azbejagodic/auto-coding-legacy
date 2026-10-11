@@ -14,6 +14,7 @@ from types import TracebackType
 from .plans import (
     FrozenPlan, PlanConflictError, PlanExecutionUnavailableError, validate_plan,
 )
+from .review_history import ReviewHistory, initialize_review_schema
 
 
 class TaskStatus(StrEnum):
@@ -142,9 +143,11 @@ class TaskStore:
                     )
                 """)
                 _initialize_plan_schema(self._connection)
+                initialize_review_schema(self._connection)
         except Exception:
             self._connection.close()
             raise
+        self.reviews = ReviewHistory(self._connection)
 
     def __enter__(self) -> TaskStore:
         return self
@@ -284,6 +287,19 @@ class TaskStore:
         if plan.fingerprint != row["fingerprint"] or plan.canonical_json != row["definition_json"]:
             raise ValueError("Stored frozen plan integrity check failed")
         return plan
+
+    def get_task_plan(self, task_id: str) -> tuple[FrozenPlan, dict] | None:
+        """Return the integrity-checked frozen definition, if this is a plan task."""
+        row = self._connection.execute(
+            "SELECT batch_id FROM plan_tasks WHERE task_id = ?", (task_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        plan = self.get_plan(row["batch_id"])
+        if plan is None:
+            raise ValueError("Frozen plan membership is inconsistent")
+        definition = next(task for task in plan.to_dict()["tasks"] if task["task_id"] == task_id)
+        return plan, definition
 
     def list_plan_tasks(self, batch_id: str) -> list[Task]:
         rows = self._connection.execute(

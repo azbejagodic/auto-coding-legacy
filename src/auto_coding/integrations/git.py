@@ -50,6 +50,14 @@ class RepositoryState:
     success: bool = True
 
 
+@dataclass(frozen=True)
+class CommitChange:
+    path: str
+    change_type: str
+    patch: str
+    old_path: str | None = None
+
+
 def _github_url(remote: str, sha: str) -> str | None:
     """Recognize github.com HTTPS, SSH URLs, and scp-style SSH remotes."""
     if remote.startswith("git@github.com:"):
@@ -98,7 +106,8 @@ class GitRepository:
         if root != self.path:
             raise GitError("validate", "Supply the repository root, not a subdirectory")
 
-    def _run(self, *args: str, allowed: tuple[int, ...] = (0,), input: str | None = None) -> subprocess.CompletedProcess[str]:
+    def _run(self, *args: str, allowed: tuple[int, ...] = (0,), input: str | None = None,
+             preserve_newlines: bool = False) -> subprocess.CompletedProcess[str]:
         # Ignore inherited Git repository/index overrides: all commands target
         # the configured root. Keep PATH/auth helpers available for normal Git.
         environment = {key: value for key, value in os.environ.items()
@@ -111,8 +120,9 @@ class GitRepository:
         try:
             completed = subprocess.run(
                 [self.executable, *literal, "-c", f"core.hooksPath={os.devnull}", *args],
-                cwd=self.path, input=input, capture_output=True, text=True,
-                encoding="utf-8", errors="replace", timeout=self.timeout,
+                cwd=self.path, input=input, capture_output=True, text=not preserve_newlines,
+                encoding=None if preserve_newlines else "utf-8",
+                errors=None if preserve_newlines else "replace", timeout=self.timeout,
                 check=False, shell=False, env=environment,
             )
         except subprocess.TimeoutExpired:
@@ -121,6 +131,14 @@ class GitRepository:
         except OSError as exc:
             logger.warning("Git %s failed to launch", args[0])
             raise GitError(args[0], f"Git could not launch (errno={exc.errno})") from None
+        if preserve_newlines:
+            try:
+                completed = subprocess.CompletedProcess(
+                    completed.args, completed.returncode,
+                    completed.stdout.decode("utf-8"), completed.stderr.decode("utf-8", errors="replace"),
+                )
+            except UnicodeDecodeError:
+                raise GitError("review", "Non-UTF-8 patch evidence is unsupported") from None
         if completed.returncode not in allowed:
             output = completed.stderr.lower()
             category = "Git command failed"
@@ -140,6 +158,75 @@ class GitRepository:
 
     def current_commit_sha(self) -> str:
         return self._sha(self._run("rev-parse", "--verify", "HEAD^{commit}").stdout.strip())
+
+    def review_changes(self, expected_branch: str, commit_sha: str,
+                       *, max_patch_bytes: int = 2_000_000,
+                       max_files: int = 200) -> tuple[CommitChange, ...]:
+        """Read only the exact current commit; no hooks, textconv or external diff.
+
+        Merge commits, non-regular blobs and ambiguous patches fail closed.
+        No remote access or repository mutation occurs.
+        """
+        from ..review_security import validate_review_path
+
+        def read(*args: str, input: str | None = None,
+                 preserve_newlines: bool = False) -> subprocess.CompletedProcess[str]:
+            return self._run("--no-replace-objects", "--no-optional-locks", *args,
+                             input=input, preserve_newlines=preserve_newlines)
+
+        if not re.fullmatch(r"[0-9a-f]{40}", commit_sha):
+            raise GitError("review", "Review requires a full 40-character SHA")
+        self._expect_branch(expected_branch)
+        self._check_operation_state()
+        if self.current_commit_sha() != commit_sha or read(
+            "status", "--porcelain=v1", "--untracked-files=all",
+        ).stdout:
+            raise GitError("review", "Review requires the exact commit and a clean repository")
+        parents = read("rev-list", "--parents", "-n", "1", commit_sha).stdout.split()
+        if not parents or parents[0] != commit_sha or len(parents) > 2:
+            raise GitError("review", "Unexpected commit or unsupported merge evidence")
+        base = parents[1] if len(parents) == 2 else read(
+            "hash-object", "-t", "tree", "--stdin", input=""
+        ).stdout.strip()
+        raw = read("diff", "--name-status", "-z", "--find-renames", "--ignore-submodules=none",
+                        "--no-ext-diff", "--no-textconv", base, commit_sha, "--").stdout
+        fields = raw.rstrip("\x00").split("\x00") if raw else []
+        changes = []
+        total = 0
+        while fields:
+            kind = fields.pop(0)
+            if not re.fullmatch(r"[AMD]|R[0-9]{1,3}", kind):
+                raise GitError("review", "Unsupported Git change type")
+            needed = 2 if kind.startswith("R") else 1
+            if len(fields) < needed or len(changes) >= max_files:
+                raise GitError("review", "Incomplete or excessive changed-file evidence")
+            paths, fields = fields[:needed], fields[needed:]
+            for path in paths:
+                validate_review_path(path)
+                for ref in (base, commit_sha):
+                    records = read("ls-tree", "-z", ref, "--", path).stdout
+                    for record in records.split("\x00"):
+                        if record and (record.partition("\t")[2] != path or
+                                       record.split()[:2] not in (["100644", "blob"], ["100755", "blob"])):
+                            raise GitError("review", "Non-regular file evidence is unsupported")
+            patch = read(
+                "-c", "core.quotePath=true", "diff", "--no-ext-diff", "--no-textconv",
+                "--no-color", "--find-renames", "--ignore-submodules=none",
+                "--unified=3", "--src-prefix=a/", "--dst-prefix=b/",
+                "--output-indicator-new=+", "--output-indicator-old=-", "--output-indicator-context= ",
+                base, commit_sha, "--", *paths, preserve_newlines=True,
+            ).stdout
+            total += len(patch.encode("utf-8"))
+            if total > max_patch_bytes or patch.count("\ndiff --git ") or "\ufffd" in patch:
+                raise GitError("review", "Patch exceeds evidence limits or is ambiguous/non-UTF-8")
+            changes.append(CommitChange(paths[-1], kind[0], patch,
+                                        paths[0] if needed == 2 else None))
+        self._expect_branch(expected_branch)
+        if self.current_commit_sha() != commit_sha or read(
+            "status", "--porcelain=v1", "--untracked-files=all",
+        ).stdout:
+            raise GitError("review", "Repository changed while collecting evidence")
+        return tuple(changes)
 
     @staticmethod
     def _sha(value: str) -> str:

@@ -1,5 +1,19 @@
 # Known issues
 
+## Quick reviewer boundaries (TASK-010)
+
+The Groq reviewer is standalone; no automatic review loop or task-status
+approval is connected. Caller-owned Python test provenance is trusted, not
+cryptographically verified or recovered after restart. Missing evidence fails
+closed. Root and ordinary single-parent commits are supported; merge commits,
+binary/non-UTF-8/non-regular files, mode-only evidence, huge individual hunks and
+budgets too small for essential context require manual final review. Git output
+is buffered before evidence-size checks. Multi-chunk approval cannot guarantee
+cross-file architecture. Secret screening can miss encoded/unusual secrets or
+reject harmless examples; SQLite is private local storage, not encryption.
+Usage is an application estimate, not exact account quota. The opt-in live smoke
+check was not run during implementation. See [review documentation](groq-reviews.md).
+
 ## Frozen plan execution is not connected (TASK-009)
 
 Plans validate/import offline, but the current controller does not enforce all

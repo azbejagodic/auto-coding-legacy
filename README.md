@@ -1,6 +1,6 @@
 # auto-coding
 
-Local auto-coding foundation with read-only diagnostics, logging, SQLite task storage, Codex CLI execution, approved tests, and a locked single-task commit/push controller. Automated AI communication for task preparation and commit reviews is not yet connected; a supported CLI integration will be implemented in a separate task. Gemini CLI is being evaluated but is not implemented. Automatic multi-task scheduling, pull requests, and the dashboard are intentionally not implemented yet.
+Local auto-coding foundation with read-only diagnostics, SQLite task storage and frozen plans, Codex CLI execution, approved tests, and a locked single-task commit/push controller. A standalone Groq quick reviewer now supports bounded diff chunks and private local review history. It is not connected to automatic task execution. Browser automation, automatic multi-task scheduling, pull requests, and the dashboard are not implemented.
 
 ## Requirements
 
@@ -48,6 +48,20 @@ in [known issues](docs/known-issues.md#existing-lock-termination-test-with-windo
 No application lock checks or test assertions are disabled.
 
 Application logs are written to `logs\auto-coding.log` when the application configures logging.
+
+## Groq quick reviews
+
+Installation includes the official `groq` SDK. Normal installation, diagnostics,
+plan imports and pytest do not make AI requests. Real reviews require a privately
+configured `GROQ_API_KEY` and an explicit programmatic invocation.
+
+Defaults: `openai/gpt-oss-120b`, `medium` reasoning, 45-second timeout, zero retries.
+The reviewer collects actual Git changes, checks full task/SHA binding and
+Python-controlled test evidence, splits bounded file/hunk sections, and stores
+sanitized transcripts/usage in the local task database. It never approves missing
+evidence, changes task status, executes code, commits, pushes, or controls a queue.
+
+See [Groq review setup, manual use, history and opt-in smoke check](docs/groq-reviews.md).
 
 ## Prewritten task plans
 

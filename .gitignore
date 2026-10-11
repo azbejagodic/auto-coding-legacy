@@ -35,6 +35,8 @@ logs/
 *.db-shm
 runtime/
 .tmp/
+review-transcripts/
+review-history/
 
 # Local configuration and credentials
 config.toml
