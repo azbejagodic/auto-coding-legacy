@@ -49,6 +49,23 @@ No application lock checks or test assertions are disabled.
 
 Application logs are written to `logs\auto-coding.log` when the application configures logging.
 
+## Prewritten task plans
+
+Validate and explicitly approve an offline JSON batch:
+
+```powershell
+python -m auto_coding plan validate examples/task-plan.json
+python -m auto_coding plan import examples/task-plan.json --db runtime/tasks.sqlite3 --approve
+```
+
+Validation is read-only. Import freezes all original task definitions and a
+deterministic SHA-256 fingerprint in one SQLite transaction, without running
+Codex, tests, Git or APIs. Batch/task collisions are rejected, including identical
+reimports. Imported tasks cannot be claimed by the legacy controller: enforcement
+of frozen scopes, tests, dependencies, reasoning effort and placeholders belongs
+to a future plan-aware execution task. Existing manually added tasks are unchanged.
+See the [versioned format and three-task example](docs/task-plans.md).
+
 ## Task storage
 
 `TaskStore` accepts a configurable database file path and creates its parent

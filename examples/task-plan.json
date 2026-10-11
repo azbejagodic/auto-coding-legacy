@@ -1,0 +1,45 @@
+{
+  "schema_version": 1,
+  "batch_id": "EXAMPLE-BATCH-001",
+  "expected_branch": "feature/001-foundation",
+  "tasks": [
+    {
+      "task_id": "EXAMPLE-001",
+      "title": "Document the example project",
+      "prompt": "Work only on {{BRANCH}}. Write docs/example.md describing the example project. Change no other files. Do not commit, push, or execute another task.",
+      "model": "gpt-5-codex",
+      "reasoning_effort": "high",
+      "task_order": 1,
+      "acceptance_criteria": ["docs/example.md describes the example project."],
+      "dependencies": [],
+      "permitted_files": ["docs/example.md"],
+      "test_commands": [["python", "-m", "pytest", "tests/test_storage.py"]],
+      "approved_placeholders": ["BRANCH"]
+    },
+    {
+      "task_id": "EXAMPLE-002",
+      "title": "Extend the example documentation",
+      "prompt": "After EXAMPLE-001 is approved, add a usage section to docs/example.md. Keep all other files unchanged. Do not commit, push, or execute another task.",
+      "model": "gpt-5-codex",
+      "reasoning_effort": "medium",
+      "task_order": 2,
+      "acceptance_criteria": ["docs/example.md contains a usage section."],
+      "dependencies": ["EXAMPLE-001"],
+      "permitted_files": ["docs/example.md"],
+      "test_commands": [["python", "-m", "pytest", "tests/test_storage.py"]]
+    },
+    {
+      "task_id": "EXAMPLE-003",
+      "title": "Document example verification",
+      "prompt": "After EXAMPLE-002 is approved, document how to verify the example in docs/example.md. The latest approved commit will be {{LATEST_SHA}}. Change no other files. Do not commit, push, or execute another task.",
+      "model": "gpt-5-codex",
+      "reasoning_effort": "high",
+      "task_order": 3,
+      "acceptance_criteria": ["docs/example.md explains verification."],
+      "dependencies": ["EXAMPLE-002"],
+      "permitted_files": ["docs/example.md"],
+      "test_commands": [["python", "-m", "pytest", "tests/test_storage.py"]],
+      "approved_placeholders": ["LATEST_SHA"]
+    }
+  ]
+}

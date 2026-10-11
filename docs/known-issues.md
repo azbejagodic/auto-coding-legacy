@@ -1,5 +1,16 @@
 # Known issues
 
+## Frozen plan execution is not connected (TASK-009)
+
+Plans validate/import offline, but the current controller does not enforce all
+frozen fields. Imported tasks therefore cannot be claimed for execution; a future
+approved task must add plan-aware enforcement and placeholder resolution first.
+Statuses and commit records may still be updated independently. Model/reasoning
+compatibility, executable availability and real filesystem/symlink containment
+are not checked by the offline validator. Human approval must cover command
+semantics and sensitive prompt content. Fingerprints are not signatures and
+SQLite is not encrypted. See [task plans](task-plans.md).
+
 ## Existing lock-termination test with Windows venv redirectors
 
 During TASK-008 validation, `test_terminated_process_releases_os_lock` failed

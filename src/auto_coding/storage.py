@@ -11,6 +11,10 @@ import re
 import sqlite3
 from types import TracebackType
 
+from .plans import (
+    FrozenPlan, PlanConflictError, PlanExecutionUnavailableError, validate_plan,
+)
+
 
 class TaskStatus(StrEnum):
     QUEUED = "queued"
@@ -137,6 +141,7 @@ class TaskStore:
                         push_state TEXT NOT NULL CHECK(push_state IN ('local', 'push_uncertain', 'verified'))
                     )
                 """)
+                _initialize_plan_schema(self._connection)
         except Exception:
             self._connection.close()
             raise
@@ -184,7 +189,8 @@ class TaskStore:
                      criteria_json, timestamp, timestamp),
                 )
         except sqlite3.IntegrityError as exc:
-            if exc.sqlite_errorname == "SQLITE_CONSTRAINT_PRIMARYKEY":
+            if (exc.sqlite_errorname == "SQLITE_CONSTRAINT_PRIMARYKEY"
+                    or str(exc) == "Frozen task definition is immutable"):
                 raise DuplicateTaskError(f"Task {task_id!r} already exists") from exc
             raise
         return Task(task_id, title, prompt, model, task_order, TaskStatus(status),
@@ -218,6 +224,12 @@ class TaskStore:
         The conditional write and commit happen before returning. Each controller
         invocation should use its own connection (SQLite's normal thread rules).
         """
+        if self._connection.execute(
+            "SELECT 1 FROM plan_tasks WHERE task_id = ?", (task_id,)
+        ).fetchone():
+            raise PlanExecutionUnavailableError(
+                "Frozen plan tasks require a plan-aware controller; no execution was claimed"
+            )
         with self._connection:
             cursor = self._connection.execute(
                 """UPDATE tasks SET status = ?, updated_at = ? WHERE task_id = ? AND status = ?
@@ -225,6 +237,60 @@ class TaskStore:
                 (TaskStatus.RUNNING, _timestamp(), task_id, TaskStatus.QUEUED),
             )
         return cursor.rowcount == 1
+
+    def import_plan(self, plan: FrozenPlan | dict, *, approved: bool = False) -> FrozenPlan:
+        """Revalidate and freeze a whole approved batch in one transaction."""
+        if approved is not True:
+            raise ValueError("Explicit plan approval is required")
+        frozen = validate_plan(plan.to_dict() if isinstance(plan, FrozenPlan) else plan)
+        definition = frozen.to_dict()
+        timestamp = _timestamp()
+        with self._connection:
+            self._connection.execute("BEGIN IMMEDIATE")
+            if self._connection.execute(
+                "SELECT 1 FROM task_plans WHERE batch_id = ?", (definition["batch_id"],)
+            ).fetchone():
+                raise PlanConflictError("Batch ID already exists; frozen plans cannot be replaced")
+            if any(self._connection.execute(
+                "SELECT 1 FROM tasks WHERE task_id = ?", (task["task_id"],)
+            ).fetchone() for task in definition["tasks"]):
+                raise PlanConflictError("A task ID already exists; the entire import was rejected")
+            self._connection.execute(
+                "INSERT INTO task_plans VALUES (?, ?, ?, ?, ?, ?, ?)",
+                (definition["batch_id"], definition["schema_version"], definition["expected_branch"],
+                 frozen.task_count, frozen.fingerprint, frozen.canonical_json, timestamp),
+            )
+            for task in definition["tasks"]:
+                self._connection.execute(
+                    """INSERT INTO tasks (task_id, title, prompt, model, task_order, status,
+                       acceptance_criteria, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (task["task_id"], task["title"], task["prompt"], task["model"], task["task_order"],
+                     TaskStatus.QUEUED, json.dumps(task["acceptance_criteria"], ensure_ascii=False),
+                     timestamp, timestamp),
+                )
+                self._connection.execute(
+                    "INSERT INTO plan_tasks VALUES (?, ?, ?)",
+                    (task["task_id"], definition["batch_id"], task["task_order"]),
+                )
+        return frozen
+
+    def get_plan(self, batch_id: str) -> FrozenPlan | None:
+        row = self._connection.execute(
+            "SELECT definition_json, fingerprint FROM task_plans WHERE batch_id = ?", (batch_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        plan = validate_plan(FrozenPlan(row["definition_json"]).to_dict())
+        if plan.fingerprint != row["fingerprint"] or plan.canonical_json != row["definition_json"]:
+            raise ValueError("Stored frozen plan integrity check failed")
+        return plan
+
+    def list_plan_tasks(self, batch_id: str) -> list[Task]:
+        rows = self._connection.execute(
+            """SELECT tasks.* FROM tasks JOIN plan_tasks USING(task_id)
+               WHERE plan_tasks.batch_id = ? ORDER BY plan_tasks.task_order""", (batch_id,)
+        ).fetchall()
+        return [_task_from_row(row) for row in rows]
 
     def get_commit(self, task_id: str) -> TaskCommit | None:
         row = self._connection.execute("SELECT * FROM task_commits WHERE task_id = ?", (task_id,)).fetchone()
@@ -276,3 +342,66 @@ class TaskStore:
             )
             if cursor.rowcount != 1:
                 raise ValueError("Task is not ready to commit")
+
+
+def _initialize_plan_schema(connection: sqlite3.Connection) -> None:
+    """Additive migration; called inside the existing initialization transaction."""
+    connection.execute("""
+        CREATE TABLE IF NOT EXISTS task_plans (
+            batch_id TEXT PRIMARY KEY NOT NULL,
+            schema_version INTEGER NOT NULL CHECK(schema_version = 1),
+            expected_branch TEXT NOT NULL,
+            task_count INTEGER NOT NULL CHECK(task_count > 0),
+            fingerprint TEXT NOT NULL CHECK(length(fingerprint) = 64),
+            definition_json TEXT NOT NULL,
+            imported_at TEXT NOT NULL
+        )
+    """)
+    connection.execute("""
+        CREATE TABLE IF NOT EXISTS plan_tasks (
+            task_id TEXT PRIMARY KEY NOT NULL REFERENCES tasks(task_id),
+            batch_id TEXT NOT NULL REFERENCES task_plans(batch_id),
+            task_order INTEGER NOT NULL,
+            UNIQUE(batch_id, task_order)
+        )
+    """)
+    # Do not use executescript: it can implicitly commit the outer migration.
+    for table in ("task_plans", "plan_tasks"):
+        for action in ("UPDATE", "DELETE"):
+            connection.execute(f"""
+                CREATE TRIGGER IF NOT EXISTS frozen_{table}_{action.lower()}
+                BEFORE {action} ON {table}
+                BEGIN SELECT RAISE(ABORT, 'Frozen plan definition is immutable'); END
+            """)
+    connection.execute("""
+        CREATE TRIGGER IF NOT EXISTS frozen_batch_replace BEFORE INSERT ON task_plans
+        WHEN EXISTS (SELECT 1 FROM task_plans WHERE batch_id = NEW.batch_id)
+        BEGIN SELECT RAISE(ABORT, 'Frozen plan definition is immutable'); END
+    """)
+    connection.execute("""
+        CREATE TRIGGER IF NOT EXISTS frozen_membership_replace BEFORE INSERT ON plan_tasks
+        WHEN EXISTS (SELECT 1 FROM plan_tasks WHERE task_id = NEW.task_id)
+        BEGIN SELECT RAISE(ABORT, 'Frozen plan definition is immutable'); END
+    """)
+    connection.execute("""
+        CREATE TRIGGER IF NOT EXISTS frozen_task_definition
+        BEFORE UPDATE OF task_id, title, prompt, model, task_order, acceptance_criteria, created_at ON tasks
+        WHEN EXISTS (SELECT 1 FROM plan_tasks WHERE task_id = OLD.task_id)
+        BEGIN SELECT RAISE(ABORT, 'Frozen task definition is immutable'); END
+    """)
+    connection.execute("""
+        CREATE TRIGGER IF NOT EXISTS frozen_task_delete BEFORE DELETE ON tasks
+        WHEN EXISTS (SELECT 1 FROM plan_tasks WHERE task_id = OLD.task_id)
+        BEGIN SELECT RAISE(ABORT, 'Frozen task definition is immutable'); END
+    """)
+    connection.execute("""
+        CREATE TRIGGER IF NOT EXISTS frozen_task_replace BEFORE INSERT ON tasks
+        WHEN EXISTS (SELECT 1 FROM plan_tasks WHERE task_id = NEW.task_id)
+        BEGIN SELECT RAISE(ABORT, 'Frozen task definition is immutable'); END
+    """)
+    connection.execute("""
+        CREATE TRIGGER IF NOT EXISTS frozen_plan_membership BEFORE INSERT ON plan_tasks
+        WHEN (SELECT count(*) FROM plan_tasks WHERE batch_id = NEW.batch_id) >=
+             (SELECT task_count FROM task_plans WHERE batch_id = NEW.batch_id)
+        BEGIN SELECT RAISE(ABORT, 'Frozen plan membership is immutable'); END
+    """)
