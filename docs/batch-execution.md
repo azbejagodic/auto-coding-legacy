@@ -156,9 +156,9 @@ repush, force-push or reset history. Resolve discrepancies with human review;
 if further implementation is required, explicitly approve a new task/batch.
 No review-only retry is automatically initiated after interruption.
 
-### Future explicitly authorized review-only recovery
+### Explicit review-only recovery (TASK-011-RECOVERY)
 
-TASK-011-REVIEW-FIX changes generic splitting only. It does not recover or mutate
+Development of TASK-011-RECOVERY did not access, recover or mutate
 `VISUAL-BOARD-BATCH-002`, rerun VISUAL2-001, or review its existing pushed commit
 `80c9098dc8cd084e97f1769d53b3cf06354c4e7f`. Leave its `awaiting_review` status,
 execution checkpoints and all review history intact. Do not use `batch run`,
@@ -174,11 +174,81 @@ prompt/configuration and genuinely commit-bound tests. Missing or uncertain
 test provenance after restart must remain UNCERTAIN; never invent passing results.
 Any need to rerun approved tests requires separate explicit authorization.
 
-Only then may an authorized operator initiate a new standalone
-`GroqReviewer.review_task(...)` review of the **same commit**, retaining previous
-reviews and recording the new review's coverage, requests and usage. This consumes
-Groq allowance, not Codex usage, and must not generate code, stage, commit or push.
-The reviewer does not finalize the stopped execution or unblock the batch:
-independent reconciliation and explicit authorization are still needed before
-changing durable execution state or continuing. No recovery command or automatic
-retry is implemented here.
+Use these commands with the actual private database path and target repository:
+
+```powershell
+# Read-only preflight; no API key or Groq usage required.
+python -m auto_coding batch review-retry BATCH_ID --db path/to/tasks.sqlite3 --repo path/to/repository --task TASK_ID
+
+# Separately authorize ONE review of the existing commit.
+python -m auto_coding batch review-retry BATCH_ID --db path/to/tasks.sqlite3 --repo path/to/repository --task TASK_ID --execute
+```
+
+Preflight opens SQLite read-only, never creates a missing database, logs or
+implementation files, and makes read-only Git remote queries. Remote access and
+authentication must work. It acquires the existing OS workspace lock; its
+coordination file may be created in the application lock directory outside the
+target repository. No application records change without `--execute`.
+The CLI reports eligible/blocked, full SHA and review IDs, not prompts.
+Set a private `GROQ_API_KEY` only for execution, following [Groq guidance](groq-reviews.md).
+
+Eligibility is deliberately narrow: `awaiting_review`, the complete original
+controller checkpoint sequence, successful Codex and exact approved Python
+tests, verified push, unchanged frozen definitions, consistent finalized
+predecessors, untouched later tasks, and a recognized local budget/preparation
+error with zero API attempts and zero chunks. The old oversized-hunk error is
+supported. Actual Groq UNCERTAIN judgments, rejected/finalized tasks, unsafe or
+missing evidence, arbitrary errors and conflicting history are refused.
+Restored test records are trusted controller provenance, not cryptographic proof.
+Missing or inconsistent records require manual investigation, not invented
+passing results or automatic retesting.
+
+Model/effort remain `openai/gpt-oss-120b` / `medium`, timeout 45 seconds, zero
+SDK retries, 12000 per-request/30000 total conservative budgets and 16 chunks.
+Explicit `--review-budget` and `--review-token-limit` match normal batch options;
+no limits increase automatically. CLI preflight blocks evidence that still cannot
+fit. A programmatic authorized attempt encountering a budget error records a new
+UNCERTAIN result without API I/O. Return codes: 0 eligible preflight/approved
+recovery, 1 blocked/nonapproval, 2 syntax error, 130 interrupted.
+
+An atomic unique `review_recoveries` claim precedes review. It retains the
+original stopped execution/review, task/commit/workspace-binding snapshots,
+configuration, timestamp and attempt ID. The new review records its original
+failure reference and recovery ID/timestamp before requests; all old history
+remains intact. Inspect privately:
+
+```python
+with TaskStore("path/to/tasks.sqlite3", read_only=True) as store:
+    event = store.executions.recovery("TASK_ID")
+    original = store.reviews.get(event["original_review_id"]) if event else None
+    retried = store.reviews.get(event["review_id"]) if event and event["review_id"] else None
+    all_reviews = store.reviews.list("TASK_ID")
+```
+
+Compare `original_execution` with the saved Codex/test checkpoints and original
+baseline, local/remote full SHAs and Git commit count to confirm no coding work
+was repeated. Recovery never calls Codex or the test runner, stages files, commits,
+pushes, checks out, resets, merges, changes the plan or starts the next task.
+It holds the existing lock through review and finalization. Complete approval
+requires exact deterministic expected chunks, durable approved requests and
+checked criteria, not just successful transport or HIGH confidence.
+Plan, source, parent chain, origin and local/remote SHA are reverified before
+transactional task/review/checkpoint/recovery finalization, using existing logic.
+REJECTED sets rejected and stops; uncertainty/errors stay blocked in awaiting_review.
+Review-only approval does not prove implementation or architectural correctness.
+
+After approval, a **separate explicit** normal invocation may proceed:
+
+```powershell
+python -m auto_coding batch run BATCH_ID --db path/to/tasks.sqlite3 --repo path/to/repository --max-tasks 1 --execute
+```
+
+It verifies and skips the recovered finalized prefix. Recovery itself never calls
+this loop. Any claimed/interrupted/nonapproving recovery blocks another attempt,
+including after restart. Inspect the audit event, both reviews, Git and processes;
+do not delete rows, reset statuses or seek another approval. No automatic recovery
+of a recovery is implemented. Network and SQLite are not one transaction; crashes
+after provider delivery can leave unknown usage requiring manual reconciliation.
+The real batch/database was not inspected, so its eligibility and budget fit
+remain unverified. This task made no live model requests or changes to
+`auto-coding-test`.

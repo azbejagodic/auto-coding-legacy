@@ -24,6 +24,13 @@ def initialize_batch_schema(connection: sqlite3.Connection) -> None:
             record_json TEXT NOT NULL
         )
     """)
+    connection.execute("""
+        CREATE TABLE IF NOT EXISTS review_recoveries (
+            task_id TEXT PRIMARY KEY REFERENCES task_executions(task_id),
+            recovery_id TEXT UNIQUE NOT NULL,
+            record_json TEXT NOT NULL
+        )
+    """)
 
 
 class BatchHistory:
@@ -56,6 +63,31 @@ class BatchHistory:
         with self._connection:
             self._connection.execute("BEGIN IMMEDIATE")
             self._checkpoint(task_id, stage, details or {})
+
+    def recovery(self, task_id: str) -> dict | None:
+        if not self._connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE name = 'review_recoveries'"
+        ).fetchone():
+            return None
+        row = self._connection.execute(
+            "SELECT task_id, recovery_id, record_json FROM review_recoveries WHERE task_id = ?", (task_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        record = json.loads(row["record_json"])
+        if record.get("task_id") != row["task_id"] or record.get("recovery_id") != row["recovery_id"]:
+            raise ValueError("Recovery audit identity is inconsistent")
+        return record
+
+    def _save_recovery(self, record: dict) -> None:
+        safe, _ = sanitize(record)
+        cursor = self._connection.execute(
+            "UPDATE review_recoveries SET record_json = ? WHERE task_id = ? AND recovery_id = ?",
+            (json.dumps(safe, ensure_ascii=False, allow_nan=False),
+             record["task_id"], record["recovery_id"]),
+        )
+        if cursor.rowcount != 1:
+            raise ValueError("Recovery audit record disappeared")
 
     def _checkpoint(self, task_id: str, stage: str, details: dict) -> None:
         """Called inside a transaction, also for atomic task finalization."""

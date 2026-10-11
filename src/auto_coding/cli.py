@@ -39,6 +39,14 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--review-token-limit", type=int, default=30000,
                      help="maximum conservative total budget per review")
     run.add_argument("--execute", action="store_true", help="explicitly authorize real execution")
+    retry = batches.add_parser("review-retry", help="preflight or explicitly retry one technical review stop")
+    retry.add_argument("batch_id")
+    retry.add_argument("--db", required=True)
+    retry.add_argument("--repo", required=True)
+    retry.add_argument("--task", required=True)
+    retry.add_argument("--review-budget", type=int, default=12000)
+    retry.add_argument("--review-token-limit", type=int, default=30000)
+    retry.add_argument("--execute", action="store_true", help="authorize one review only; never coding or push")
     return parser
 
 
@@ -102,6 +110,28 @@ def main(argv: list[str] | None = None) -> int:
             from .batch_controller import BatchController
             from .reviews import ReviewConfig
             config = ReviewConfig(request_budget=args.review_budget, max_review_tokens=args.review_token_limit)
+            if args.batch_command == "review-retry":
+                # Inspect an existing database read-only even when execution was
+                # requested. No migration/write precedes the verified preflight.
+                with TaskStore(args.db, read_only=True) as store:
+                    preflight = BatchController(store, review_config=config).review_retry(
+                        args.batch_id, args.repo, task_id=args.task,
+                    )
+                if not args.execute or not preflight.success:
+                    result = preflight
+                else:
+                    with TaskStore(args.db) as store:
+                        result = BatchController(store, review_config=config).review_retry(
+                            args.batch_id, args.repo, task_id=args.task, execute=True,
+                        )
+                print(f"Review recovery {'attempt' if result.executed else 'preflight'}: "
+                      f"batch={result.batch_id}; task={result.task_id}; "
+                      f"{'approved' if result.executed and result.success else 'eligible' if result.success else 'blocked'}; "
+                      f"SHA={result.commit_sha or '-'}; original review={result.original_review_id or '-'}; "
+                      f"new review={result.review_id or '-'}; decision={result.decision or '-'}")
+                if result.error:
+                    print(result.error, file=sys.stderr)
+                return 0 if result.success else 1
             with TaskStore(args.db) as store:
                 result = BatchController(store, review_config=config).run(
                     args.batch_id, args.repo, max_tasks=args.max_tasks

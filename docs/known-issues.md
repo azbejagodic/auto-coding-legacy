@@ -4,7 +4,8 @@
 
 The Groq reviewer is now connected by the approved batch controller.
 Caller-owned Python test provenance is trusted, not
-cryptographically verified or recovered after restart. Missing evidence fails
+cryptographically verified. Review-only recovery restores only complete trusted
+controller checkpoints, not arbitrary model summaries. Missing evidence fails
 closed. Root and ordinary single-parent commits are supported; merge commits,
 binary/non-UTF-8/non-regular files, mode-only evidence, indivisible oversized
 lines/context and budgets too small for essential context require manual final
@@ -22,8 +23,10 @@ Plans validate/import offline; explicit approved execution now enforces frozen
 fields and Groq approval under the existing lock. Historical plans without
 explicit execution limits cannot run; approve a new identity with those limits.
 Any unfinished execution stops for manual inspection, rather than resuming
-Codex, committing, pushing or reviewing again. Only a consistent finalized prefix
-can resume automatically. A crash between Git and SQLite can leave a commit only
+Codex, committing or pushing. Explicit review-only recovery is limited to
+recognized zero-request technical review-preparation failures with complete
+original evidence. Only a consistent finalized prefix can resume normally.
+A crash between Git and SQLite can leave a commit only
 in Git; checkpoints and HEAD/reflog need manual reconciliation. No atomic
 transaction spans Git, SQLite, remote pushes and provider requests.
 Statuses and commit records may still be updated independently. Model/reasoning
@@ -37,11 +40,16 @@ remain trusted. Review budget limits can stop large prompts, indivisible lines,
 or excessive total evidence even when chunking is enabled. No real unattended batch or live review was run during
 implementation. See [batch execution](batch-execution.md) and [task plans](task-plans.md).
 
-TASK-011-REVIEW-FIX does not reconcile the real `VISUAL-BOARD-BATCH-002` stopped
+TASK-011-RECOVERY does not reconcile the real `VISUAL-BOARD-BATCH-002` stopped
 review. Its committed/pushed task and history must remain untouched until a
-separately authorized review-only recovery; see the [recovery procedure](batch-execution.md#future-explicitly-authorized-review-only-recovery).
+separately authorized review-only recovery; see the [recovery procedure](batch-execution.md#explicit-review-only-recovery-task-011-recovery).
 Generic offline coverage does not guarantee that this particular packet fits the
 unchanged 12000 per-request and 30000 total conservative budgets.
+Recovery allows only one durably claimed attempt per stopped task. Interrupted
+or nonapproving attempts require manual reconciliation; there is no retry of a
+recovery or atomic transaction spanning provider delivery and SQLite.
+Preflight performs read-only remote queries and uses the existing external OS
+coordination lock file, but creates no application records or model requests.
 
 ## Existing lock-termination test with Windows venv redirectors
 

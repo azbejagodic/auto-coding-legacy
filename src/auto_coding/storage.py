@@ -10,6 +10,7 @@ from pathlib import Path
 import re
 import sqlite3
 from types import TracebackType
+from uuid import uuid4
 
 from .plans import (
     FrozenPlan, PlanConflictError, PlanExecutionUnavailableError, validate_plan,
@@ -392,35 +393,145 @@ class TaskStore:
         """Caller verifies authoritative review/Git evidence before finalization."""
         with self._connection:
             self._connection.execute("BEGIN IMMEDIATE")
-            execution = self.executions.get(task_id)
-            commit = self.get_commit(task_id)
-            frozen = self.get_task_plan(task_id)
-            if (not execution or execution["stage"] != "review_finished"
-                    or execution.get("review_id") != review_id
-                    or not commit or commit.push_state != PushState.VERIFIED
-                    or execution.get("remote_sha") != commit.commit_sha
-                    or execution.get("local_sha") != commit.commit_sha
-                    or not frozen or execution["fingerprint"] != frozen[0].fingerprint):
-                raise ValueError("Execution is not ready for finalization")
-            self.validate_plan_tasks(frozen[0])
-            review = self.reviews.get(review_id)
-            expected = "APPROVED" if approved else "REJECTED"
-            if (not review or review["task_id"] != task_id or review["commit_sha"] != commit.commit_sha
-                    or review["decision"] != expected
-                    or (approved and (review.get("error") or review.get("coverage_complete") is not True))):
-                raise ValueError("Durable review differs from finalization")
-            cursor = self._connection.execute(
-                "UPDATE tasks SET status = ?, updated_at = ? WHERE task_id = ? AND status = ?",
-                (TaskStatus.APPROVED if approved else TaskStatus.REJECTED, _timestamp(),
-                 task_id, TaskStatus.AWAITING_REVIEW),
+            self._finalize_plan_task(task_id, review_id, approved=approved)
+
+    def _finalize_plan_task(self, task_id: str, review_id: str, *, approved: bool) -> None:
+        """Shared finalization inside the caller's transaction."""
+        execution = self.executions.get(task_id)
+        commit = self.get_commit(task_id)
+        frozen = self.get_task_plan(task_id)
+        if (not execution or execution["stage"] != "review_finished"
+                or execution.get("review_id") != review_id
+                or not commit or commit.push_state != PushState.VERIFIED
+                or execution.get("remote_sha") != commit.commit_sha
+                or execution.get("local_sha") != commit.commit_sha
+                or not frozen or execution["fingerprint"] != frozen[0].fingerprint):
+            raise ValueError("Execution is not ready for finalization")
+        self.validate_plan_tasks(frozen[0])
+        review = self.reviews.get(review_id)
+        expected = "APPROVED" if approved else "REJECTED"
+        if (not review or review["task_id"] != task_id or review["commit_sha"] != commit.commit_sha
+                or review["decision"] != expected
+                or (approved and (review.get("error") or review.get("coverage_complete") is not True))):
+            raise ValueError("Durable review differs from finalization")
+        cursor = self._connection.execute(
+            "UPDATE tasks SET status = ?, updated_at = ? WHERE task_id = ? AND status = ?",
+            (TaskStatus.APPROVED if approved else TaskStatus.REJECTED, _timestamp(),
+             task_id, TaskStatus.AWAITING_REVIEW),
+        )
+        if cursor.rowcount != 1:
+            raise ValueError("Task state changed during review")
+        self.executions._checkpoint(task_id, "finalized" if approved else "stopped", {
+            "ended_at": _timestamp(), "failure_stage": None if approved else "review",
+            "error": None if approved else "Groq rejected the commit",
+            "recovery_required": not approved,
+        })
+
+    def claim_review_recovery(self, plan: FrozenPlan, task: Task, execution: dict,
+                              original_review: dict, config: dict, binding: dict) -> dict:
+        """Durable one-attempt intent. Interrupted attempts are never replayed."""
+        from dataclasses import asdict
+        with self._connection:
+            self._connection.execute("BEGIN IMMEDIATE")
+            if (self.get_plan(plan.batch_id) != plan or self.get_task(task.task_id) != task
+                    or task.status != TaskStatus.AWAITING_REVIEW
+                    or self.executions.get(task.task_id) != execution
+                    or self.executions.binding(plan.batch_id) != binding
+                    or self.reviews.list(task.task_id) != [original_review]
+                    or self.executions.recovery(task.task_id) is not None):
+                raise ValueError("Recovery state changed or was already claimed")
+            self.validate_plan_tasks(plan)
+            commit = self.get_commit(task.task_id)
+            if (not commit or commit.push_state != PushState.VERIFIED
+                    or commit.commit_sha != execution.get("local_sha")
+                    or commit.commit_sha != original_review["commit_sha"]):
+                raise ValueError("Recovery commit state changed")
+            record = {
+                "recovery_id": uuid4().hex, "task_id": task.task_id, "batch_id": plan.batch_id,
+                "commit_sha": commit.commit_sha, "original_review_id": original_review["review_id"],
+                "started_at": _timestamp(), "stage": "claimed", "review_id": None,
+                "original_execution": execution, "original_review": original_review,
+                "original_task": asdict(task), "original_commit": asdict(commit), "config": config,
+                "original_binding": binding,
+            }
+            self._connection.execute(
+                "INSERT INTO review_recoveries VALUES (?, ?, ?)",
+                (task.task_id, record["recovery_id"], json.dumps(record, ensure_ascii=False, allow_nan=False)),
             )
-            if cursor.rowcount != 1:
-                raise ValueError("Task state changed during review")
-            self.executions._checkpoint(task_id, "finalized" if approved else "stopped", {
-                "ended_at": _timestamp(), "failure_stage": None if approved else "review",
-                "error": None if approved else "Groq rejected the commit",
-                "recovery_required": not approved,
-            })
+        return record
+
+    def attach_recovery_review(self, task_id: str, recovery_id: str, review_id: str) -> None:
+        with self._connection:
+            self._connection.execute("BEGIN IMMEDIATE")
+            record = self.executions.recovery(task_id)
+            review = self.reviews.get(review_id)
+            if (not record or record["recovery_id"] != recovery_id or record["stage"] != "claimed"
+                    or not review or review["task_id"] != task_id
+                    or review["commit_sha"] != record["commit_sha"]
+                    or review.get("recovery_id") != recovery_id):
+                raise ValueError("Recovery review attachment differs from the claimed attempt")
+            record.update(stage="reviewing", review_id=review_id)
+            self.executions._save_recovery(record)
+
+    def finish_review_recovery(self, task_id: str, recovery_id: str, review_id: str,
+                               expected_review: dict) -> None:
+        """Atomic review linkage, task finalization and recovery-event completion."""
+        from dataclasses import asdict
+        from .batch_controller import _approval
+        with self._connection:
+            self._connection.execute("BEGIN IMMEDIATE")
+            record = self.executions.recovery(task_id)
+            if (not record or record["recovery_id"] != recovery_id
+                    or record["stage"] != "reviewing" or record["review_id"] != review_id):
+                raise ValueError("Recovery is missing, interrupted or already completed")
+            plan = self.get_plan(record["batch_id"])
+            task, commit = self.get_task(task_id), self.get_commit(task_id)
+            review = self.reviews.get(review_id)
+            if (not plan or plan.fingerprint != record["original_execution"]["fingerprint"]
+                    or not task or asdict(task) != record["original_task"]
+                    or not commit or asdict(commit) != record["original_commit"]
+                    or self.executions.get(task_id) != record["original_execution"]
+                    or self.executions.binding(record["batch_id"]) != record["original_binding"]
+                    or self.reviews.get(record["original_review_id"]) != record["original_review"]
+                    or review != expected_review
+                    or not review or review.get("recovery_id") != recovery_id
+                    or review["task_id"] != task_id or review["commit_sha"] != commit.commit_sha):
+                raise ValueError("Recovery evidence changed before finalization")
+            histories = self.reviews.list(task_id)
+            if len(histories) != 2 or {item["review_id"] for item in histories} != {
+                record["original_review_id"], review_id
+            }:
+                raise ValueError("Conflicting review history appeared before finalization")
+            self.validate_plan_tasks(plan)
+            decision = review["decision"]
+            if decision == "APPROVED" and not _approval(
+                review, task_id, commit.commit_sha, task.acceptance_criteria
+            ):
+                raise ValueError("Recovery approval lacks durable complete coverage")
+            if decision == "REJECTED" and not review.get("blocking_issues"):
+                raise ValueError("Recovery rejection lacks a blocking issue")
+            if decision not in ("APPROVED", "REJECTED", "UNCERTAIN"):
+                raise ValueError("Invalid recovery decision")
+            details = {"review_id": review_id, "review_status": decision, "recovery_id": recovery_id}
+            if decision in ("APPROVED", "REJECTED"):
+                self.executions._checkpoint(task_id, "review_finished", details)
+                self._finalize_plan_task(task_id, review_id, approved=decision == "APPROVED")
+            else:
+                self.executions._checkpoint(task_id, "stopped", {
+                    **details, "failure_stage": "review_recovery", "recovery_required": True,
+                    "error": "Recovery review did not provide complete approval", "ended_at": _timestamp(),
+                })
+            record.update(stage="finished", decision=decision, finished_at=_timestamp())
+            self.executions._save_recovery(record)
+
+    def block_review_recovery(self, task_id: str, recovery_id: str) -> None:
+        with self._connection:
+            self._connection.execute("BEGIN IMMEDIATE")
+            record = self.executions.recovery(task_id)
+            if record and record["recovery_id"] == recovery_id and record["stage"] != "finished":
+                record.update(stage="blocked", error="Recovery interrupted or safety/persistence verification failed",
+                              finished_at=_timestamp())
+                self.executions._save_recovery(record)
 
     def get_task_plan(self, task_id: str) -> tuple[FrozenPlan, dict] | None:
         """Return the integrity-checked frozen definition, if this is a plan task."""

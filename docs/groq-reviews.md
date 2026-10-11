@@ -71,9 +71,9 @@ cryptographic proof of test provenance. Never construct passing results from
 Codex/Groq summaries. After restart, absent trustworthy test evidence means
 `UNCERTAIN`, not approval. Imported plans additionally require the exact approved
 test arguments, branch, scope (including both rename paths), integrity-checked
-plan fingerprint and original configuration. The existing controller does not
-yet execute imported tasks; this compatibility is tested using synthetic offline
-runner results, not live task execution.
+plan fingerprint and original configuration. The approved batch controller
+executes imported tasks; tests use synthetic offline runner results, not live
+model execution.
 
 `build_review_packet` is separately reusable. Lower-level `review(packet)`
 accepts a trusted caller-owned packet; use the Git-building interface above to
@@ -82,6 +82,26 @@ Missing task/commit identity raises `ReviewError` before any API call. For an
 existing matching record, unavailable/unsafe Git or test evidence produces a
 stored `UNCERTAIN` result without contacting Groq. Database failures propagate;
 they cannot return an eligible approval.
+
+### Review-only recovery
+
+The explicit [batch review-retry command](batch-execution.md#explicit-review-only-recovery-task-011-recovery)
+handles only recognized zero-request technical preparation failures, never a
+Groq rejection or substantive UNCERTAIN decision. It restores strictly validated
+controller-owned test checkpoints for the existing verified pushed commit; no
+Codex work, tests, implementation commit or push is repeated. Dry-run preflight
+opens SQLite read-only and performs locked Git/remote verification without Groq.
+`--execute` authorizes one bounded review; it does not start the next task.
+
+An additive private `review_recoveries` event snapshots the original stopped
+execution/review and binds the new attempt. New review records include
+`recovery_id`, `original_review_id` and `recovery_timestamp` before requests,
+with ordinary usage, chunk coverage, findings and transcripts preserved.
+Interrupted attempts fail closed and cannot be retried automatically.
+Only complete, identity-reverified approval allows the controller's atomic
+finalization; the reviewer alone still never changes task status.
+The model/effort remain `openai/gpt-oss-120b` / `medium`, with unchanged bounded
+SDK behavior and no automatic budget increase or provider fallback.
 
 ## Evidence and response validation
 

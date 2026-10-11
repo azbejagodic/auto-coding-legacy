@@ -10,7 +10,7 @@ import os
 from pathlib import Path
 import re
 import shutil
-from typing import Callable
+from typing import Callable, TYPE_CHECKING
 
 from .controller import SingleTaskController
 from .integrations.codex import run_codex
@@ -24,6 +24,9 @@ from .workspace_lock import WorkspaceLockError
 
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from .review_recovery import RecoveryResult
 
 
 @dataclass(frozen=True)
@@ -79,6 +82,12 @@ class BatchController:
         # Frozen configuration adds essential context. Keep the existing reviewer
         # and model/effort defaults, with an explicit bounded batch wire budget.
         self.review_config = review_config or ReviewConfig(request_budget=12000)
+
+    def review_retry(self, batch_id: str, working_directory: str | Path, *,
+                     task_id: str, execute: bool = False) -> RecoveryResult:
+        """Explicit single-attempt recovery, never the ordinary execution loop."""
+        from .review_recovery import ReviewRecovery
+        return ReviewRecovery(self).run(batch_id, working_directory, task_id=task_id, execute=execute)
 
     def run(self, batch_id: str, working_directory: str | Path, *, max_tasks: int | None = None) -> BatchResult:
         current = last = sha = decision = None

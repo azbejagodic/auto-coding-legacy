@@ -164,7 +164,7 @@ class GroqReviewer:
             )
         return self.review(packet)
 
-    def review(self, packet: ReviewPacket) -> ReviewResult:
+    def review(self, packet: ReviewPacket, *, recovery_id: str | None = None) -> ReviewResult:
         packet = deepcopy(packet)
         task = self.store.get_task(packet.task_id)
         commit = self.store.get_commit(packet.task_id)
@@ -182,7 +182,16 @@ class GroqReviewer:
             "decision": "UNCERTAIN", "confidence": "LOW", "coverage_complete": False,
             "chunk_count": 0, "error": "Review incomplete",
         }
+        if recovery_id is not None:
+            recovery = self.store.executions.recovery(packet.task_id)
+            if (not recovery or recovery["recovery_id"] != recovery_id or recovery["stage"] != "claimed"
+                    or recovery["commit_sha"] != packet.commit_sha or recovery["config"] != asdict(self.config)):
+                raise ReviewError("Review does not match the claimed recovery")
+            record.update(recovery_id=recovery_id, original_review_id=recovery["original_review_id"],
+                          recovery_timestamp=recovery["started_at"])
         review_id = self.store.reviews.create(packet.task_id, packet.commit_sha, record)
+        if recovery_id is not None:
+            self.store.attach_recovery_review(packet.task_id, recovery_id, review_id)
         findings: dict[str, list[str]] = {key: [] for key in ARRAY_FIELDS}
         responses: list[dict] = []
         error = None
