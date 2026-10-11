@@ -6,8 +6,10 @@ The Groq reviewer is now connected by the approved batch controller.
 Caller-owned Python test provenance is trusted, not
 cryptographically verified or recovered after restart. Missing evidence fails
 closed. Root and ordinary single-parent commits are supported; merge commits,
-binary/non-UTF-8/non-regular files, mode-only evidence, huge individual hunks and
-budgets too small for essential context require manual final review. Git output
+binary/non-UTF-8/non-regular files, mode-only evidence, indivisible oversized
+lines/context and budgets too small for essential context require manual final
+review. Large hunks now split losslessly at line boundaries; unchanged total
+allowance/chunk limits can still stop a review. Git output
 is buffered before evidence-size checks. Multi-chunk approval cannot guarantee
 cross-file architecture. Secret screening can miss encoded/unusual secrets or
 reject harmless examples; SQLite is private local storage, not encryption.
@@ -31,9 +33,15 @@ semantics and sensitive prompt content. Fingerprints are not signatures and
 SQLite is not encrypted. The controller cannot enforce developer instructions as
 an OS security boundary: Codex must not commit/push, and unexpected Git state
 stops execution, but approved local programs and local Git/auth configuration
-remain trusted. Review budget limits can stop large prompts or single hunks even
-when chunking is enabled. No real unattended batch or live review was run during
+remain trusted. Review budget limits can stop large prompts, indivisible lines,
+or excessive total evidence even when chunking is enabled. No real unattended batch or live review was run during
 implementation. See [batch execution](batch-execution.md) and [task plans](task-plans.md).
+
+TASK-011-REVIEW-FIX does not reconcile the real `VISUAL-BOARD-BATCH-002` stopped
+review. Its committed/pushed task and history must remain untouched until a
+separately authorized review-only recovery; see the [recovery procedure](batch-execution.md#future-explicitly-authorized-review-only-recovery).
+Generic offline coverage does not guarantee that this particular packet fits the
+unchanged 12000 per-request and 30000 total conservative budgets.
 
 ## Existing lock-termination test with Windows venv redirectors
 

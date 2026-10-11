@@ -8,12 +8,13 @@ import hashlib
 import json
 import math
 import re
-from typing import Any
+from typing import Any, Callable
 
 from .review_security import sanitize, validate_review_path
 
 
-TEMPLATE_VERSION = "1"
+TEMPLATE_VERSION = "2"
+_HUNK_HEADER = re.compile(r"@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@[^\n]*\n?")
 SHA = re.compile(r"[0-9a-f]{40}\Z")
 DECISIONS = ("APPROVED", "REJECTED", "UNCERTAIN")
 CONFIDENCES = ("LOW", "MEDIUM", "HIGH")
@@ -223,12 +224,79 @@ def request_arguments(config: ReviewConfig, instructions: str, content: str) -> 
     }
 
 
+def _diff_lines(text: str) -> list[str]:
+    # Git delimits lines with LF, not Unicode separators or bare CR. Retain bytes.
+    parts = text.split("\n")
+    return [part + "\n" for part in parts[:-1]] + ([parts[-1]] if parts[-1] else [])
+
+
+def _split_hunk(section: dict, fits: Callable[[list[dict]], bool]) -> list[dict]:
+    """Partition primary evidence; repeated neighbors are explicitly context only."""
+    lines = _diff_lines(section["body"])
+    match = _HUNK_HEADER.fullmatch(lines[0]) if lines else None
+    if match is None:
+        raise ReviewError("Diff metadata exceeds the safe request budget")
+    hunk_header, body = lines[0], lines[1:]
+    old_start, _, new_start, _ = match.groups()
+    old_offsets, new_offsets = [0], [0]
+    # Keep a no-newline marker attached to the preceding source line.
+    boundaries = [0]
+    for index, line in enumerate(body):
+        old_offsets.append(old_offsets[-1] + int(line.startswith((" ", "-"))))
+        new_offsets.append(new_offsets[-1] + int(line.startswith((" ", "+"))))
+        if index + 1 == len(body) or not body[index + 1].startswith("\\"):
+            boundaries.append(index + 1)
+
+    def fragment(first: int, last: int) -> dict:
+        start, end = boundaries[first], boundaries[last]
+        before = boundaries[max(0, first - 3)]
+        after = boundaries[min(len(boundaries) - 1, last + 3)]
+        return {
+            **section, "section_id": f'{section["section_id"]}:{start}-{end}',
+            "body": "".join(body[start:end]),
+            "fragment": {
+                "parent_section_id": section["section_id"], "hunk_header": hunk_header,
+                "hunk_body_lines": len(body), "primary_body_lines": [start, end],
+                "old_range": {"start": int(old_start) + old_offsets[start],
+                              "count": old_offsets[end] - old_offsets[start]},
+                "new_range": {"start": int(new_start) + new_offsets[start],
+                              "count": new_offsets[end] - new_offsets[start]},
+                "context_only": {
+                    "before": {"body_lines": [before, start], "body": "".join(body[before:start])},
+                    "after": {"body_lines": [end, after], "body": "".join(body[end:after])},
+                },
+            },
+        }
+
+    result = []
+    first = 0
+    while first < len(boundaries) - 1:
+        # With a fixed first boundary, primary+following context grows
+        # monotonically. Measure the actual serialized request, not raw text.
+        low, high = first + 1, len(boundaries) - 1
+        if not fits([fragment(first, low)]):
+            raise ReviewError("A diff line or required hunk context exceeds the safe request budget")
+        best = low
+        while low <= high:
+            middle = (low + high) // 2
+            if fits([fragment(first, middle)]):
+                best, low = middle, middle + 1
+            else:
+                high = middle - 1
+        result.append(fragment(first, best))
+        first = best
+    # Check exact reconstruction, not merely a count of generated identifiers.
+    if not result or hunk_header + "".join(item["body"] for item in result) != section["body"]:
+        raise ReviewError("Incomplete diff fragment coverage")
+    return result
+
+
 def build_chunks(packet: ReviewPacket, config: ReviewConfig, *,
                  instructions: str | None = None) -> tuple[ReviewChunk, ...]:
     """Byte upper-bound estimate, including schema/messages and output reserve.
 
-    Hunk text is never split arbitrarily. Headers repeat for each file section.
-    A single enormous hunk fails closed instead of losing context.
+    Preserve files/hunks where possible, then partition oversized hunks at
+    complete diff lines with separately labeled context and exact coverage.
     """
     validate_packet(packet)
     instructions = template() if instructions is None else instructions
@@ -241,22 +309,26 @@ def build_chunks(packet: ReviewPacket, config: ReviewConfig, *,
     sections: list[dict] = []
     for index, change in enumerate(packet.changes):
         # Actual hunk lines start @@; source content starts space/+/-.
-        lines = change.patch.splitlines(keepends=True)
+        lines = _diff_lines(change.patch)
         starts = [i for i, line in enumerate(lines) if line.startswith("@@ ")]
         if starts:
             header = "".join(lines[:starts[0]])
             for hunk, start in enumerate(starts):
                 end = starts[hunk + 1] if hunk + 1 < len(starts) else len(lines)
-                match = re.fullmatch(r"@@ -\d+(?:,(\d+))? \+\d+(?:,(\d+))? @@[^\n]*\n?", lines[start])
+                match = _HUNK_HEADER.fullmatch(lines[start])
                 if match is None:
                     raise ReviewError("Unsupported diff hunk header")
                 body = lines[start + 1:end]
-                if any(not line.startswith((" ", "+", "-", "\\ No newline at end of file"))
-                       for line in body):
-                    raise ReviewError("Unsupported diff hunk body")
+                for position, line in enumerate(body):
+                    if line.startswith((" ", "+", "-")):
+                        continue
+                    if (line.rstrip("\r\n") != "\\ No newline at end of file"
+                            or position == 0 or body[position - 1].startswith("\\")):
+                        raise ReviewError("Unsupported diff hunk body")
                 old = sum(line.startswith((" ", "-")) for line in body)
                 new = sum(line.startswith((" ", "+")) for line in body)
-                if (old, new) != tuple(int(count) if count is not None else 1 for count in match.groups()):
+                if (old, new) != tuple(int(count) if count is not None else 1
+                                       for count in (match[2], match[4])):
                     raise ReviewError("Incomplete diff hunk coverage")
                 sections.append({"section_id": f"{index}:{hunk}", **manifest[index],
                                  "header": header, "body": "".join(lines[start:end])})
@@ -284,19 +356,27 @@ def build_chunks(packet: ReviewPacket, config: ReviewConfig, *,
 
     _, whole_size = make(sections, 1, 1)
     groups: list[list[dict]] = []
+    expected_sections = sections
     if whole_size <= config.request_budget:
         groups = [sections]
     else:
+        if make([])[1] > config.request_budget:
+            raise ReviewError("Essential review evidence exceeds the safe request budget")
+        expected_sections = []
         group: list[dict] = []
         # Keep whole files together where possible, then fall back to hunks.
         for file_index in range(len(packet.changes)):
             file_sections = [s for s in sections if s["section_id"].startswith(f"{file_index}:")]
-            units = [file_sections] if make(file_sections)[1] <= config.request_budget else [
-                [section] for section in file_sections
-            ]
+            if make(file_sections)[1] <= config.request_budget:
+                units = [file_sections]
+            else:
+                units = []
+                for section in file_sections:
+                    parts = ([section] if make([section])[1] <= config.request_budget else
+                             _split_hunk(section, lambda items: make(items)[1] <= config.request_budget))
+                    units.extend([part] for part in parts)
             for unit in units:
-                if make(unit)[1] > config.request_budget:
-                    raise ReviewError("A diff hunk or essential evidence exceeds the safe request budget")
+                expected_sections.extend(unit)
                 if group and make([*group, *unit])[1] > config.request_budget:
                     groups.append(group)
                     group = []
@@ -308,10 +388,12 @@ def build_chunks(packet: ReviewPacket, config: ReviewConfig, *,
     chunks = []
     for index, group in enumerate(groups, 1):
         content, size = make(group, len(groups), index)
+        if size > config.request_budget:
+            raise ReviewError("Final review request exceeds the safe request budget")
         identity = hashlib.sha256(content.encode("utf-8")).hexdigest()
         chunks.append(ReviewChunk(identity, tuple(s["section_id"] for s in group), content, size))
     coverage = [section for chunk in chunks for section in chunk.coverage]
-    if coverage != [section["section_id"] for section in sections] or len(set(coverage)) != len(coverage):
+    if coverage != [section["section_id"] for section in expected_sections] or len(set(coverage)) != len(coverage):
         raise ReviewError("Incomplete or duplicate diff coverage")
     if sum(chunk.estimated_tokens for chunk in chunks) > config.max_review_tokens:
         raise ReviewError("Total review allowance would be exceeded")

@@ -10,7 +10,7 @@ import pytest
 from groq.types.chat import ChatCompletion
 
 from auto_coding.integrations.groq import GroqReviewer, rate_blocked, rate_headers
-from auto_coding.reviews import FileChange, ReviewConfig, ReviewError, encoded
+from auto_coding.reviews import FileChange, ReviewConfig, ReviewError, build_chunks, encoded
 from auto_coding.storage import TaskStore
 
 from test_reviews import SHA, PATCH, packet, response
@@ -193,6 +193,60 @@ def test_malformed_second_chunk(store, packet):
     result = GroqReviewer(store, ReviewConfig(request_budget=8000, max_review_tokens=100000), client=client).review(packet)
     assert result.decision == "UNCERTAIN" and not result.coverage_complete
     assert client.chat.completions.with_raw_response.create.call_count == 2
+
+
+@pytest.mark.parametrize("outcome,expected", [
+    ("APPROVED", "APPROVED"), ("REJECTED", "REJECTED"),
+    ("UNCERTAIN", "UNCERTAIN"), ("malformed", "UNCERTAIN"),
+])
+def test_fragmented_hunk_complete_approval_required(store, packet, outcome, expected):
+    from test_review_fragments import large_addition
+
+    packet = replace(packet, changes=(large_addition("css"),))
+    config = ReviewConfig(request_budget=12000)
+    chunks = build_chunks(packet, config)
+    assert len(chunks) > 1
+    replies = [raw_reply(packet) for _ in chunks]
+    if outcome != "APPROVED":
+        replies[0] = raw_reply(packet, data="{" if outcome == "malformed" else response(
+            packet, decision=outcome,
+            blocking_issues=["Defect in primary section"] if outcome == "REJECTED" else [],
+        ))
+    client = client_for(*replies)
+    before_task, before_commit = store.get_task(packet.task_id), store.get_commit(packet.task_id)
+    result = GroqReviewer(store, config, client=client).review(packet)
+    history = store.reviews.get(result.review_id)
+    assert result.decision == expected
+    assert result.eligible_to_proceed == (outcome == "APPROVED")
+    assert result.coverage_complete == (outcome in ("APPROVED", "UNCERTAIN"))
+    assert history["chunk_count"] == len(chunks)
+    assert history["chunks"] == [
+        {"chunk_id": chunk.chunk_id, "coverage": list(chunk.coverage)} for chunk in chunks]
+    expected_calls = 1 if outcome in ("REJECTED", "malformed") else len(chunks)
+    assert client.chat.completions.with_raw_response.create.call_count == expected_calls
+    for request, chunk in zip(history["requests"], chunks):
+        assert request["coverage"] == list(chunk.coverage)
+        assert request["chunk_id"] == chunk.chunk_id
+        assert request["submitted"]["messages"][1]["content"] == chunk.content
+        assert request["estimated_tokens"] <= config.request_budget
+        assert request["submitted"]["reasoning_effort"] == "medium"
+    assert store.get_task(packet.task_id) == before_task
+    assert store.get_commit(packet.task_id) == before_commit
+
+
+def test_essential_overflow_no_requests_or_state_changes(store, packet):
+    packet = replace(packet, tests={**packet.tests, "stdout": "Test evidence.\n" * 2000})
+    client = client_for()
+    before_task, before_commit = store.get_task(packet.task_id), store.get_commit(packet.task_id)
+    result = GroqReviewer(store, ReviewConfig(request_budget=12000), client=client).review(packet)
+    assert result.decision == "UNCERTAIN" and not result.coverage_complete
+    assert "Essential review evidence" in result.error
+    client.with_options.assert_not_called()
+    history = store.reviews.get(result.review_id)
+    assert history["api_requests"] == history["chunk_count"] == 0
+    assert history["requests"] == []
+    assert store.get_task(packet.task_id) == before_task
+    assert store.get_commit(packet.task_id) == before_commit
 
 
 def test_sensitive_input_and_output_not_sent_or_stored(store, packet):

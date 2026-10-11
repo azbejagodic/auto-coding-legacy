@@ -82,7 +82,9 @@ review budget and chunk limit. Full frozen configuration needs more essential
 context than standalone legacy tasks. Override with `--review-budget` and
 `--review-token-limit` before starting, or pass a `ReviewConfig` to
 `BatchController`. These budgets are not exact token/account quota estimates.
-Unreviewable essential context or a single oversized hunk stops, never truncates.
+Oversized hunks split losslessly into line-bounded primary sections with labeled
+context overlap. Unreviewable essential context, an indivisible line/context,
+or per-request/total/chunk limits still stop; evidence is never truncated.
 
 ## Safety and durable state
 
@@ -153,3 +155,30 @@ Do not simply delete execution rows, requeue tasks, re-run Codex, recommit,
 repush, force-push or reset history. Resolve discrepancies with human review;
 if further implementation is required, explicitly approve a new task/batch.
 No review-only retry is automatically initiated after interruption.
+
+### Future explicitly authorized review-only recovery
+
+TASK-011-REVIEW-FIX changes generic splitting only. It does not recover or mutate
+`VISUAL-BOARD-BATCH-002`, rerun VISUAL2-001, or review its existing pushed commit
+`80c9098dc8cd084e97f1769d53b3cf06354c4e7f`. Leave its `awaiting_review` status,
+execution checkpoints and all review history intact. Do not use `batch run`,
+requeue/reset, delete rows, recommit or repush to retry this review.
+
+A separate, explicitly authorized review-only recovery must first back up the
+private history and inspect the original frozen plan, task/commit/execution
+records and trusted Python test evidence. Under exclusive workspace ownership,
+reverify the exact approved branch, clean HEAD, recorded full commit SHA, parent,
+scope, origin and matching remote commit, with no surviving task processes.
+Rebuild authoritative evidence for that existing commit, using the untouched
+prompt/configuration and genuinely commit-bound tests. Missing or uncertain
+test provenance after restart must remain UNCERTAIN; never invent passing results.
+Any need to rerun approved tests requires separate explicit authorization.
+
+Only then may an authorized operator initiate a new standalone
+`GroqReviewer.review_task(...)` review of the **same commit**, retaining previous
+reviews and recording the new review's coverage, requests and usage. This consumes
+Groq allowance, not Codex usage, and must not generate code, stage, commit or push.
+The reviewer does not finalize the stopped execution or unblock the batch:
+independent reconciliation and explicit authorization are still needed before
+changing durable execution state or continuing. No recovery command or automatic
+retry is implemented here.

@@ -94,7 +94,8 @@ Only explicitly changed paths are read; no files are staged or removed.
 Patch bytes preserve CRLF/LF differences, replacement objects are disabled for
 evidence reads, and optional Git index-refresh writes are disabled.
 
-The packaged template `src/auto_coding/templates/groq-review.md` is version 1.
+The packaged template `src/auto_coding/templates/groq-review.md` is version 2
+(explicit primary-fragment versus context-only semantics).
 Its content digest and version are recorded, along with actual submitted
 instructions. Bump the version when changing review policy.
 
@@ -130,6 +131,9 @@ limits; do not equate tokens-per-minute with safe per-request input capacity.
 
 A complete small diff uses one request. Larger diffs keep whole files together
 where possible, otherwise split at validated unified-diff hunk boundaries.
+An oversized hunk is partitioned at complete LF-delimited diff lines; CRLF,
+Unicode source and Git no-final-newline markers are retained exactly. A marker
+stays attached to its preceding line. No source line is split or rewritten.
 File headers, change types, rename source/destination, task/SHA, original
 requirements, test evidence and the changed-file manifest accompany each chunk.
 Each section has a stable identity; chunks have SHA-256 identities and ordered
@@ -137,9 +141,35 @@ coverage lists. All original hunks and metadata must be accounted for exactly
 once. Hunk line counts are verified; text is never arbitrarily truncated.
 Empty-file additions/deletions and pure renames have explicit metadata sections.
 
-One oversized hunk, excessive chunks, mode-only changes without useful context,
-unreviewable sections or essential evidence too large to repeat safely cause
-`UNCERTAIN` before requests. Git output is buffered before the 2 MB/200-file
+Unsplit sections retain their `file-index:hunk-index` identity and original
+`header`/`body` format. Fragment IDs append `:start-end`, a zero-based half-open
+range of the original hunk's body lines, including no-final-newline markers.
+For fragments, `header` remains the exact file header; `body` is only that range's
+primary evidence. The `fragment` metadata repeats the original `hunk_header`
+(never a fabricated header for the slice), parent section ID and original body
+line count. `old_range`/`new_range` give source-line cursors and consumed counts:
+start at the original hunk's old/new starting line, advance on context/removal
+or context/addition respectively; markers consume neither. Zero-count sides
+retain their original cursor, including zero for new/deleted files.
+`context_only.before`/`after` provide up to three neighboring source diff lines
+with attached markers and explicit body-line ranges. They are overlap, never
+additional primary coverage. Joining ordered primary bodies under the original
+hunk header reconstructs the exact original hunk; contiguous ranges cover every
+body line once. Reconstruction and ordered unique section coverage are checked
+before requests. Persisted request content retains these references.
+
+Every candidate and final request is measured with the complete serialized
+schema, instructions, repeated requirements/configuration/tests/manifest,
+section metadata and overlap, plus output reservation and headroom. Chunk
+count/index sizing is conservative. No limits are increased by fragmentation.
+
+The previous combined oversized-hunk/essential-evidence error could arise from
+either a long hunk or large repeated essential evidence (or both); a commit's
+line count alone cannot identify which. Essential evidence overflow now has a
+separate error. Oversized single lines, required context/metadata that cannot
+fit, excessive chunks or total review allowance, mode-only changes without useful
+context, unreviewable sections or essential evidence too large to repeat safely
+cause `UNCERTAIN` before requests. Git output is buffered before the 2 MB/200-file
 evidence cap is checked, so this is not a hard process-memory limit.
 
 Any valid rejection makes the overall review `REJECTED`; a rejection stops
