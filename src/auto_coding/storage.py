@@ -429,20 +429,27 @@ class TaskStore:
 
     def claim_review_recovery(self, plan: FrozenPlan, task: Task, execution: dict,
                               original_review: dict, config: dict, binding: dict, *,
-                              previous_recovery: dict | None = None) -> dict:
+                              previous_recovery: dict | None = None,
+                              continuation: dict | None = None) -> dict:
         """Durable one-attempt intent. Interrupted attempts are never replayed."""
         from dataclasses import asdict
         with self._connection:
             self._connection.execute("BEGIN IMMEDIATE")
             previous_reviews = ([previous_recovery["original_review"], original_review]
                                 if previous_recovery is not None else [original_review])
+            if continuation is not None:
+                previous_reviews = continuation["previous_reviews"]
+                audit_matches = self.executions.signatures(self.executions.recoveries(task.task_id)) == continuation["prior_recoveries"]
+            else:
+                audit_matches = (self.executions.recovery(task.task_id) == previous_recovery
+                                 and self.executions.recovery(task.task_id, compatibility=True) is None
+                                 and not self.executions.continuations(task.task_id))
             if (self.get_plan(plan.batch_id) != plan or self.get_task(task.task_id) != task
                     or task.status != TaskStatus.AWAITING_REVIEW
                     or self.executions.get(task.task_id) != execution
                     or self.executions.binding(plan.batch_id) != binding
                     or self.reviews.list(task.task_id) != previous_reviews
-                    or self.executions.recovery(task.task_id) != previous_recovery
-                    or self.executions.recovery(task.task_id, compatibility=True) is not None):
+                    or not audit_matches):
                 raise ValueError("Recovery state changed or was already claimed")
             self.validate_plan_tasks(plan)
             commit = self.get_commit(task.task_id)
@@ -467,10 +474,18 @@ class TaskStore:
                 table = "review_compatibility_recoveries"
                 record.update(compatibility_retry=True, previous_recovery=previous_recovery,
                               previous_reviews=previous_reviews)
-            self._connection.execute(
-                f"INSERT INTO {table} VALUES (?, ?, ?)",
-                (task.task_id, record["recovery_id"], json.dumps(record, ensure_ascii=False, allow_nan=False)),
-            )
+            if continuation is not None:
+                if previous_reviews[-1] != original_review:
+                    raise ValueError("Continuation parent differs from the inspected review")
+                record.update(technical_continuation=True, **continuation)
+                self._connection.execute("INSERT INTO review_continuations VALUES (?, ?, ?, ?)",
+                    (task.task_id, record["recovery_id"], original_review["review_id"],
+                     json.dumps(record, ensure_ascii=False, allow_nan=False)))
+            else:
+                self._connection.execute(
+                    f"INSERT INTO {table} VALUES (?, ?, ?)",
+                    (task.task_id, record["recovery_id"], json.dumps(record, ensure_ascii=False, allow_nan=False)),
+                )
         return record
 
     def attach_recovery_review(self, task_id: str, recovery_id: str, review_id: str) -> None:
@@ -517,7 +532,10 @@ class TaskStore:
                         *(item["review_id"] for item in previous), review_id}
                     or any(self.reviews.get(item["review_id"]) != item for item in previous)
                     or (record.get("compatibility_retry") and
-                        self.executions.recovery(task_id) != record["previous_recovery"])):
+                        self.executions.recovery(task_id) != record["previous_recovery"])
+                    or (record.get("technical_continuation") and
+                        self.executions.signatures([r for r in self.executions.recoveries(task_id) if r["recovery_id"] != recovery_id])
+                        != record["prior_recoveries"])):
                 raise ValueError("Conflicting review history appeared before finalization")
             self.validate_plan_tasks(plan)
             decision = review["decision"]

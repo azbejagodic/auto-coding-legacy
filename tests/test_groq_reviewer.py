@@ -180,7 +180,7 @@ def test_multi_chunk_aggregation(store, packet, decisions, expected):
 def test_missing_chunk_or_rate_budget_is_uncertain(store, packet):
     packet = large_packet(packet)
     client = client_for(raw_reply(packet, headers={
-        "x-ratelimit-remaining-tokens": "0", "x-ratelimit-reset-tokens": "1m0s",
+        "x-ratelimit-remaining-tokens": "0", "x-ratelimit-reset-tokens": "1m1s",
     }))
     result = GroqReviewer(store, ReviewConfig(request_budget=8000, max_review_tokens=100000), client=client).review(packet)
     assert result.decision == "UNCERTAIN" and not result.coverage_complete

@@ -11,7 +11,11 @@ The reviewer itself still makes no execution or task-state decisions.
 
 Use Python 3.12 and `python -m pip install --editable ".[test]"`.
 The declared dependency is the official `groq>=1.7.0,<2` SDK (tested with 1.7.0).
-Install/import never makes an API request.
+Install/import never makes an AI API request. The added `tiktoken>=0.11,<1`
+dependency supports offline GPT-OSS sizing. A compressed, SHA-256-verified
+ordinary-token vocabulary is packaged with attribution; runtime sizing never
+downloads tokenizer files or creates cache directories. Reinstall the updated
+package with the setup command above before using the new reviewer.
 
 Keep the key in an OS secret manager or the current process environment, not
 in code, task prompts, test arguments, Git, command history or local config files.
@@ -145,6 +149,65 @@ authorization to bypass its own tests, locks, state checks or Git safeguards.
 
 ## Budgeting and complete coverage
 
+### Runtime token sizing and rate limits (TASK-011-GROQ-RUNTIME-FIX)
+
+The wire-byte planner below remains available for offline/legacy diagnostics.
+Actual Groq reviews and recovery preflight additionally use the GPT-OSS
+ordinary-token segmentation/ranks from `o200k_harmony` (same ordinary vocabulary
+as `o200k_base`). Message contents/roles and structured JSON schema are counted
+locally, with per-message framing margin, the maximum output/reasoning reserve,
+and at least 512 extra tokens for provider framing. These are **local estimates**,
+not provider-reported usage or exact knowledge of Groq's hidden chat template.
+Only validated response usage contributes to usage totals.
+
+Each request must satisfy BOTH the unchanged configurable wire-byte ceiling
+and a provider token ceiling: at most 8,000 estimated tokens for this model,
+or a smaller saved organization limit. Whole files/hunks remain together when
+they fit; otherwise the same lossless hunk/line splitter is reused. Requirements,
+tests, configuration, manifest and every primary changed line remain present.
+Essential evidence that cannot fit still fails closed. No model/effort/output
+limit changes or fallback are made.
+
+For live-review planning, `max_review_tokens` / `--review-token-limit` now caps
+the sum of **tokenizer estimates including reserves**, not the sum of unrelated
+wire-byte units. The numeric default stays 30,000, and the 16-chunk cap stays.
+The pure legacy byte planner retains its original byte-based total behavior.
+CLI/history report wire units and tokenizer estimates separately; the historical
+request `estimated_tokens` field is still wire units, while new
+`estimated_provider_tokens` is the local token estimate. This avoids both falsely
+treating 29,405 wire units as actual Groq tokens and rejecting a necessary split
+solely because it repeats requirements on the wire.
+
+Read-only measurement of the saved first website packet: original single request
+9,948 estimated tokens; provider-sized requests 6,623 and 7,341 (13,964 total).
+Their wire sizes are 20,255 and 20,079 units, each below 30,000. The old 29,405
+wire-unit estimate was not an actual token count. No Groq call or remote Git
+operation was used for this measurement; the private database hash was unchanged.
+
+Root cause of the local permanent block: the saved completion timestamp was
+present and valid, but `1ms` was not recognized as a reset duration. Combined
+with the incompatible wire-unit/remaining-token comparison, it became an unknown
+reset and blocked forever. Millisecond and compound durations now parse correctly.
+Response headers have their own durable `rate_limits_observed_at`; old records
+fall back to their original completion/creation time, never the current time.
+Missing, malformed, naive or future observations fail closed. Expired deadlines
+cease blocking; a reset cannot make a request larger than the provider capacity fit.
+
+The first request is refused while known limits are active or uninterpretable.
+Between sequential chunks, the reviewer may wait once for a known reset of at
+most 60 seconds, then recheck before recording/sending the new request. It never
+retries a sent request; SDK retries remain zero. Longer/unknown waits stop locally.
+A new, smaller limit observed mid-review stops before an oversized next request.
+Provider HTTP/429, authentication, quota and transport errors still stop, with
+safe diagnostics; no automatic resend occurs. Organization-wide concurrent use,
+RPM/TPD limits absent from headers and server-side token accounting can still
+produce rejection. Header snapshots are not a guarantee of available allowance.
+See [Groq's rate-limit semantics](https://console.groq.com/docs/rate-limits).
+Any provider rejection or uncertain review still cannot approve the commit.
+
+Eligible completed local capacity blocks can use the explicitly authorized
+[technical continuation](batch-execution.md#explicit-technical-review-only-continuation).
+
 `ReviewConfig` defaults:
 
 - Model `openai/gpt-oss-120b`; reasoning `medium` (`low`/`high` configurable).
@@ -152,7 +215,7 @@ authorization to bypass its own tests, locks, state checks or Git safeguards.
 - Request budget 30,000; output/reasoning reservation 1,536; headroom 512.
 - At most 16 chunks and 30,000 conservative units across the whole review.
 
-Input is conservatively estimated using UTF-8 bytes of serialized request
+The pure legacy planner conservatively estimates UTF-8 bytes of serialized request
 arguments (including the schema/instructions/messages), not the common
 characters-divided-by-four heuristic. Output reservation and headroom are
 additional. This is intentionally restrictive and is not an exact tokenizer

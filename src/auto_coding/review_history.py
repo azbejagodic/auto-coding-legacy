@@ -138,7 +138,7 @@ class ReviewHistory:
             if item.get("error"):
                 errors.append(item["error"])
             if item.get("rate_limits"):
-                headers = {"observed_at": item.get("completed_at", row["created_at"]), **item["rate_limits"]}
+                headers = self._limits(item, row["created_at"])
         return {**totals, "api_requests": len(requests), "unknown_usage_requests": unknown,
                 "errors": errors, "provider_reported": headers, "period_start": start,
                 "period_end": end, "estimate_only": True, "account_remaining_quota": None}
@@ -150,5 +150,12 @@ class ReviewHistory:
         for row in rows:
             item = json.loads(row["record_json"])
             if item.get("model") == model and item.get("rate_limits"):
-                return {"observed_at": item.get("completed_at", row["created_at"]), **item["rate_limits"]}
+                return self._limits(item, row["created_at"])
         return {}
+
+    @staticmethod
+    def _limits(item: dict, created_at: str) -> dict:
+        # Preserve a response observation; never move an old deadline to 'now'.
+        # Legacy records use their durable completion/creation timestamp.
+        return {**item["rate_limits"], "observed_at": item.get(
+            "rate_limits_observed_at", item.get("completed_at", created_at))}

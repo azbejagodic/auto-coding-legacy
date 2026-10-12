@@ -55,7 +55,9 @@ Application logs are written to `logs\auto-coding.log` when the application conf
 
 ## Groq quick reviews
 
-Installation includes the official `groq` SDK. Normal installation, diagnostics,
+Installation includes the official `groq` SDK and local `tiktoken` tokenizer,
+with a bundled verified vocabulary for offline request sizing. Reinstall the
+updated package using the setup command above when upgrading. Normal installation, diagnostics,
 plan imports and pytest do not make AI requests. Real reviews require a privately
 configured `GROQ_API_KEY` and an explicit programmatic review or approved batch run.
 

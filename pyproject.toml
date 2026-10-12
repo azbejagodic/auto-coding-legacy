@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Local workflow automation foundation for the auto-coding project."
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
-dependencies = ["groq>=1.7.0,<2"]
+dependencies = ["groq>=1.7.0,<2", "tiktoken>=0.11,<1"]
 
 [project.optional-dependencies]
 test = ["pytest>=8.0"]
@@ -20,7 +20,7 @@ auto-coding = "auto_coding.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-auto_coding = ["templates/*.md"]
+auto_coding = ["templates/*.md", "assets/*.gz", "assets/NOTICE.txt"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

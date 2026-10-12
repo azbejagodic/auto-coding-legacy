@@ -178,7 +178,7 @@ def test_total_cap_is_not_increased_for_larger_commits(practical_packet):
     assert failed.value.diagnostics.total_budget == 30000
 
 
-def test_mocked_review_uses_one_full_request_and_only_provider_usage_is_counted(practical_packet, tmp_path, monkeypatch):
+def test_mocked_review_uses_provider_sized_requests_and_only_reported_usage_is_counted(practical_packet, tmp_path, monkeypatch):
     from unittest.mock import Mock
     import httpx
     from auto_coding.integrations.groq import GroqReviewer
@@ -193,12 +193,13 @@ def test_mocked_review_uses_one_full_request_and_only_provider_usage_is_counted(
                        model="codex-test", task_order=1, acceptance_criteria=list(packet.acceptance_criteria),
                        status="awaiting_review")
         store.record_commit(packet.task_id, packet.commit_sha, packet.branch, None)
-        client = client_for(raw_reply(packet))
+        client = client_for(*[raw_reply(packet) for _ in range(16)])
         result = GroqReviewer(store, client=client).review(packet)
         assert result.eligible_to_proceed and result.coverage_complete
-        client.chat.completions.with_raw_response.create.assert_called_once()
         record = store.reviews.get(result.review_id)
+        assert 1 < record["chunk_count"] <= 16
         assert record["budget_diagnostics"]["estimated_total_units"] > 28000
-        assert record["usage"]["total_tokens"] == store.reviews.usage()["total_tokens"] == 125
-        assert record["api_requests"] == record["chunk_count"] == 1
+        assert record["usage"]["total_tokens"] == store.reviews.usage()["total_tokens"] == 125 * record["chunk_count"]
+        assert record["api_requests"] == record["chunk_count"] == client.chat.completions.with_raw_response.create.call_count
+        assert record["budget_diagnostics"]["largest_request_tokens"] <= 8000
         assert store.get_task(packet.task_id).status == "awaiting_review"

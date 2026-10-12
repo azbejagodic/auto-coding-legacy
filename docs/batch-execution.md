@@ -207,6 +207,9 @@ passing results or automatic retesting.
 
 Model/effort remain `openai/gpt-oss-120b` / `medium`, timeout 45 seconds, zero
 SDK retries, 30000 per-request/30000 total conservative budgets and 16 chunks.
+TASK-011-GROQ-RUNTIME-FIX adds a separate 8000-token provider ceiling and uses
+local tokenizer estimates for the total budget in actual Groq reviews. The
+wire-byte per-request ceiling stays unchanged. See [runtime sizing](groq-reviews.md#runtime-token-sizing-and-rate-limits-task-011-groq-runtime-fix).
 Explicit `--review-budget` and `--review-token-limit` match normal batch options;
 no limits increase automatically. CLI preflight blocks evidence that still cannot
 fit. A programmatic authorized attempt encountering a budget error records a new
@@ -301,12 +304,65 @@ stopped execution. Inspect it privately with
 `store.executions.recovery(task_id, compatibility=True)`. The original
 `review_recoveries` row and both prior reviews remain unchanged. The new review
 records `recovery_attempt=2`, `previous_recovery_id`, `original_review_id` (the
-failed HTTP review), and its own recovery ID/timestamp. No third claim is allowed,
+failed HTTP review), and its own recovery ID/timestamp. No third compatibility claim is allowed,
 including after crash, interruption, API failure, rejection or uncertainty.
 Historical data is never deleted to enable another approval attempt.
+This legacy compatibility mode remains one-time. The separately bound generic
+continuation below handles a subsequent completed **local** block, never a third
+compatibility retry or a repeat of an uncertain HTTP request.
 
 All normal coverage/criteria checks and post-review identity verification still
 apply before atomic finalization. This path never calls Codex, reruns tests,
 stages, commits, pushes or starts another task. Development used only temporary
 databases/repositories and mocked HTTP; the actual private database and target
 repository were not changed and no live recovery or API request was made.
+
+### Explicit technical review-only continuation
+
+`--continue-technical` reuses the existing locked review-only path for a completed
+local capacity block. It requires the exact latest blocked review ID, approved
+fingerprint, commit SHA and branch, plus `--execute` for any real request. It
+verifies the frozen task, original successful Codex/test provenance, current clean
+checkout, scope/parent chain, hashed origin and matching remote commit. Preflight
+also checks first-request capacity and token-aware complete chunk planning.
+It creates no database records, migrations or model requests.
+
+Read-only preflight for the existing blocked batch (after installing the updated
+package in the normal Python environment):
+
+```powershell
+python -m auto_coding batch review-retry VISUAL-BOARD-BATCH-002 --db runtime/tasks.sqlite3 --repo 'C:\Users\Ažbe\Desktop\auto-coding-test' --task VISUAL2-001 --continue-technical --failed-review-id c9b3660f83c14a768ccea8f8bd083dc1 --expected-fingerprint 002ca0284a67606eaaa18ddb71f341eda8834b203e0d611719caaeb7d2056436 --expected-sha 80c9098dc8cd084e97f1769d53b3cf06354c4e7f --expected-branch feature/visual-board-test
+```
+
+No `--execute` is present. As before, preflight acquires the external coordination
+lock and makes read-only remote queries; it does not access Groq. The real
+preflight/recovery was not run during this task. Local paths remain configurable.
+
+Eligibility requires `Provider rate limit/reset prevents another request` with
+zero requests, or a complete, individually validated APPROVED prefix followed
+by an unsent chunk. Unknown/pending delivery, HTTP/network/provider failures,
+REJECTED or substantive UNCERTAIN responses, unresolved model findings, unsafe
+evidence and unfinished/blocked audits require manual inspection. The existing
+explicitly reconciled legacy unsupported-`store` attempt may remain earlier in
+the verified chain; it is not a generic HTTP retry permission.
+
+Each authorization targets ONE parent review and ONE new bounded complete
+review. A successful prefix is not copied as approval: an explicitly authorized
+continuation reviews all current chunks anew, possibly rechecking previously
+approved evidence. This may consume allowance again, but never silently resends
+an unknown-outcome request. If another attempt finishes with a local unsent-work
+block, the operator can authorize its NEW review ID with the same command. Old
+authorization cannot be replayed. There is no automatic continuation or coding
+retry, and no automatic approval or next-task execution.
+
+The additive `review_continuations` table stores unique parent-review claims,
+review/execution/task/commit snapshots and SHA-256 bindings of every prior audit.
+Prior review and recovery records are unchanged. Hash bindings avoid recursively
+duplicating audit snapshots on repeated local blocks. Inspect privately with
+`store.executions.continuations(task_id)` or `store.executions.recoveries(task_id)`.
+Claims/finalization use existing atomic SQLite transactions and the workspace
+lock; changed history or uncertain writes block finalization/replay. A crash or
+interruption is not considered a completed local block, even if it happened
+before network I/O. Recovery never reruns Codex, tests, staging, commits or pushes.
+APPROVED still requires all current chunks and criteria to approve durably,
+complete coverage, and post-review repository/remote verification.

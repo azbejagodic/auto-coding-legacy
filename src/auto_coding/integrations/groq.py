@@ -11,12 +11,14 @@ import logging
 import math
 from pathlib import Path
 import re
+import time
 from typing import Any, TYPE_CHECKING
 
 import groq
 
 from ..review_history import utc_now
 from ..review_security import sanitize
+from .groq_limits import provider_plan, request_tokens
 from ..reviews import (
     ARRAY_FIELDS, CONFIDENCES, ReviewConfig, ReviewError, ReviewPacket, ReviewResult,
     TEMPLATE_VERSION, plan_chunks, request_arguments, template, validate_response,
@@ -87,19 +89,27 @@ def _seconds(value: str) -> float | None:
         return number if math.isfinite(number) and number >= 0 else None
     except ValueError:
         pass
-    if re.fullmatch(r"(?:\d+(?:\.\d+)?[dhms])+", value):
-        return sum(float(number) * {"d": 86400, "h": 3600, "m": 60, "s": 1}[unit]
-                   for number, unit in re.findall(r"(\d+(?:\.\d+)?)([dhms])", value))
+    if re.fullmatch(r"(?:\d+(?:\.\d+)?(?:ms|[dhms]))+", value):
+        number = sum(float(number) * {"d": 86400, "h": 3600, "m": 60, "s": 1, "ms": .001}[unit]
+                     for number, unit in re.findall(r"(\d+(?:\.\d+)?)(ms|[dhms])", value))
+        return number if math.isfinite(number) else None
     return None
 
 
-def rate_blocked(limits: dict, required_tokens: int) -> bool:
-    """Do not retry or sleep: stop until supplied provider limits have reset."""
+def rate_delay(limits: dict, required_tokens: int) -> float | None:
+    """Seconds until known capacity, or None for uncertain/impossible capacity.
+
+    required_tokens is a tokenizer estimate including reserved output, NOT bytes.
+    """
     if not limits:
-        return False
+        return 0.0
     try:
+        if type(required_tokens) is not int or required_tokens <= 0:
+            return None
         observed = datetime.fromisoformat(limits["observed_at"])
         now = datetime.now(timezone.utc)
+        if observed.utcoffset() is None or observed > now + timedelta(seconds=1):
+            return None
         checks = []
         if "retry-after" in limits:
             value = limits["retry-after"]
@@ -108,16 +118,37 @@ def rate_blocked(limits: dict, required_tokens: int) -> bool:
                         else parsedate_to_datetime(value))
             checks.append(deadline)
         for kind, required in (("requests", 1), ("tokens", required_tokens)):
+            capacity = limits.get(f"x-ratelimit-limit-{kind}")
+            if capacity is not None and int(capacity) < required:
+                return None  # A reset cannot make an oversized request fit.
             remaining = limits.get(f"x-ratelimit-remaining-{kind}")
+            if remaining is not None and (int(remaining) < 0 or
+                    capacity is not None and int(remaining) > int(capacity)):
+                return None
             if remaining is not None and int(remaining) < required:
                 reset = limits.get(f"x-ratelimit-reset-{kind}")
                 seconds = _seconds(reset) if reset is not None else None
                 if seconds is None:
-                    return True  # Known exhaustion, unknown reset: human inspection.
+                    return None  # Known exhaustion, unknown reset: human inspection.
                 checks.append(observed + timedelta(seconds=seconds))
-        return any(deadline > now for deadline in checks)
+        return max([0.0, *((deadline - now).total_seconds() for deadline in checks)])
     except (ValueError, TypeError, KeyError, OverflowError):
-        return True  # Uninterpretable provider limits are not permission to spend.
+        return None  # Uninterpretable provider limits are not permission to spend.
+
+
+def rate_blocked(limits: dict, required_tokens: int) -> bool:
+    delay = rate_delay(limits, required_tokens)
+    return delay is None or delay > 0
+
+
+def wait_for_capacity(limits: dict, required_tokens: int) -> bool:
+    """One bounded wait BEFORE a new request; never resend or retry a request."""
+    delay = rate_delay(limits, required_tokens)
+    if delay is None or delay > 60:
+        return False
+    if delay:
+        time.sleep(delay)
+    return not rate_blocked(limits, required_tokens)
 
 
 def _provider_error(exc: Exception) -> tuple[str, dict, dict]:
@@ -132,6 +163,7 @@ def _provider_error(exc: Exception) -> tuple[str, dict, dict]:
             "http_status": status if type(status) is int and 100 <= status <= 599 else None,
             "provider_error_type": _error_label(error.get("type")),
             "provider_error_code": _error_label(error.get("code")),
+            "rate_limits_observed_at": utc_now(),
         }
     if isinstance(exc, groq.AuthenticationError):
         category = "authentication"
@@ -242,6 +274,9 @@ class GroqReviewer:
             if recovery.get("compatibility_retry"):
                 record.update(recovery_attempt=2,
                               previous_recovery_id=recovery["previous_recovery"]["recovery_id"])
+            if recovery.get("technical_continuation"):
+                record.update(technical_continuation=True,
+                              prior_recovery_ids=[r["recovery_id"] for r in recovery["prior_recoveries"]])
         review_id = self.store.reviews.create(packet.task_id, packet.commit_sha, record)
         if recovery_id is not None:
             self.store.attach_recovery_review(packet.task_id, recovery_id, review_id)
@@ -262,7 +297,8 @@ class GroqReviewer:
                               if key not in ("prompt", "title", "acceptance_criteria")}
                 if packet.approved_configuration != definition:
                     raise ReviewError("Frozen task configuration differs from review evidence")
-            planned = plan_chunks(packet, self.config, instructions=instructions)
+            planned = provider_plan(packet, self.config, self.store.reviews.latest_limits(self.config.model),
+                                    instructions=instructions)
             chunks = planned.chunks
             record["budget_diagnostics"] = asdict(planned.diagnostics)
         except (ReviewError, ValueError) as exc:
@@ -275,13 +311,18 @@ class GroqReviewer:
         for index, chunk in enumerate(chunks, 1):
             if error:
                 break
-            if rate_blocked(self.store.reviews.latest_limits(self.config.model), chunk.estimated_tokens):
+            arguments = request_arguments(self.config, instructions, chunk.content)
+            required_tokens = request_tokens(arguments, headroom=self.config.headroom)
+            limits = self.store.reviews.latest_limits(self.config.model)
+            capacity = (not rate_blocked(limits, required_tokens) if index == 1
+                        else wait_for_capacity(limits, required_tokens))
+            if not capacity:
                 error = "Provider rate limit/reset prevents another request"
                 break
-            arguments = request_arguments(self.config, instructions, chunk.content)
             request = {
                 "model": self.config.model, "chunk_id": chunk.chunk_id,
                 "coverage": list(chunk.coverage), "estimated_tokens": chunk.estimated_tokens,
+                "estimated_provider_tokens": required_tokens,
                 "submitted": arguments, "response": None, "usage": None,
                 "request_timeout": self.config.timeout, "max_retries": 0,
                 "completed": False, "error": "Response missing", "rate_limits": {},
@@ -302,6 +343,7 @@ class GroqReviewer:
             try:
                 client = self._client.with_options(timeout=self.config.timeout, max_retries=0)
                 raw = client.chat.completions.with_raw_response.create(**arguments)
+                request["rate_limits_observed_at"] = utc_now()
                 request["rate_limits"] = rate_headers(raw.headers)
                 response_text = raw.text() if callable(raw.text) else raw.text
                 if isinstance(response_text, str):

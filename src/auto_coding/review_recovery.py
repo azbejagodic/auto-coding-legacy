@@ -8,16 +8,18 @@ import math
 import os
 from pathlib import Path
 import re
+from functools import partial
 from typing import TYPE_CHECKING
 
 from .batch_controller import _approval
 from .integrations.git import GitError, GitRepository
-from .integrations.groq import GroqReviewer
+from .integrations.groq import GroqReviewer, rate_blocked
+from .integrations.groq_limits import provider_plan, request_tokens
 from .plans import FrozenPlan
 from .review_evidence import build_review_packet
 from .reviews import (
     ReviewConfig, ReviewDiagnostics, ReviewError, ReviewPacket, ReviewResult, SHA,
-    encoded, plan_chunks, request_arguments, template,
+    encoded, plan_chunks, request_arguments, template, validate_response,
 )
 from .storage import PushState, Task, TaskStatus
 from .test_runner import CommandResult, TestRunResult
@@ -42,6 +44,7 @@ STOPPED_STAGES = (
     "commit_started", "commit_created", "push_started", "push_verified",
     "review_started", "review_finished", "stopped",
 )
+LOCAL_RATE_BLOCK = "Provider rate limit/reset prevents another request"
 
 
 @dataclass(frozen=True)
@@ -61,6 +64,10 @@ class CompatibilityRetry:
                 or not SHA.fullmatch(self.commit_sha) or not self.branch
                 or self.branch.casefold() in ("main", "master")):
             raise ValueError("Exact failed review, fingerprint, commit and development branch are required")
+
+
+class TechnicalContinuation(CompatibilityRetry):
+    """Explicit identity binding to one completed, locally blocked review."""
 
 
 @dataclass(frozen=True)
@@ -156,6 +163,77 @@ def _compatibility_failure(previous: dict, execution: dict, failed: dict,
         raise ValueError("Failed request is ambiguous, not the completed unsupported-store request")
 
 
+def _local_failure(record: dict, packet: ReviewPacket) -> None:
+    """Only unsent work after a local block; completed approving prefixes are safe.
+
+    A new explicitly authorized review rechecks ALL chunks. No approval is copied
+    and no uncertain delivery, provider judgment or unresolved finding is retried.
+    """
+    if (record.get("task_id") != packet.task_id or record.get("commit_sha") != packet.commit_sha
+            or record.get("error") != LOCAL_RATE_BLOCK or record.get("decision") != "UNCERTAIN"
+            or record.get("confidence") != "LOW" or record.get("coverage_complete") is not False
+            or record.get("provider") != "GroqCloud" or record.get("model") != "openai/gpt-oss-120b"
+            or record.get("reasoning_effort") != "medium" or record.get("missing_evidence") != []
+            or record.get("blocking_issues") != []
+            or record.get("template_sha256") != hashlib.sha256(template().encode()).hexdigest()):
+        raise ValueError("Review is not a completed local capacity block without findings")
+    config = ReviewConfig(**record["config"])
+    if config.model != "openai/gpt-oss-120b" or config.reasoning_effort != "medium":
+        raise ValueError("Historical review configuration differs from the pinned model/effort")
+    cap = record.get("budget_diagnostics", {}).get("provider_token_limit")
+    planned = plan_chunks(packet, config,
+                          token_counter=partial(request_tokens, headroom=config.headroom) if cap else None,
+                          token_limit=cap)
+    chunks = planned.chunks
+    requests = record["requests"]
+    if (record.get("chunks") != [{"chunk_id": c.chunk_id, "coverage": list(c.coverage)} for c in chunks]
+            or type(record.get("chunk_count")) is not int or record["chunk_count"] != len(chunks)
+            or type(record.get("api_requests")) is not int or record["api_requests"] != len(requests)
+            or len(requests) >= len(chunks)):
+        raise ValueError("Local block coverage or request history is inconsistent")
+    checked = []
+    for index, (request, chunk) in enumerate(zip(requests, chunks), 1):
+        if (request.get("completed") is not True or request.get("error") is not None
+                or request.get("decision") != "APPROVED"
+                or request.get("response_redacted") is True
+                or request.get("request_index") != index or request.get("max_retries") != 0
+                or request.get("request_timeout") != config.timeout
+                or request.get("chunk_id") != chunk.chunk_id or request.get("coverage") != list(chunk.coverage)
+                or request.get("submitted") != request_arguments(config, template(), chunk.content)):
+            raise ValueError("Previous request delivery or approval is uncertain")
+        response = request.get("response") or {}
+        choices = response.get("choices", [])
+        if response.get("model") != config.model or len(choices) != 1 or choices[0].get("finish_reason") != "stop":
+            raise ValueError("Previous request has no complete verified model response")
+        message = choices[0]["message"]
+        if any(message.get(key) for key in ("refusal", "tool_calls", "function_call", "executed_tools")):
+            raise ValueError("Previous model response contains unsupported evidence")
+        data = validate_response(choices[0]["message"]["content"], packet)
+        if data["decision"] != "APPROVED" or data["blocking_issues"] or data["needs_final_review"]:
+            raise ValueError("Unresolved model findings cannot be retried")
+        checked.extend(data["requirements_checked"])
+    checked = list(dict.fromkeys(checked))
+    expected_notes = (["Multi-chunk approval does not guarantee cross-file architectural correctness."]
+                      if len(chunks) > 1 else [])
+    if any(item not in checked for item in packet.acceptance_criteria):
+        expected_notes.append("Not all approved acceptance criteria were demonstrably checked.")
+    if record.get("requirements_checked") != checked or record.get("needs_final_review") != expected_notes:
+        raise ValueError("Unresolved or inconsistent local-block findings require manual inspection")
+
+
+def _stopped_after(event: dict, current: dict) -> None:
+    base = event["original_execution"]
+    mutable = {"review_id", "review_status", "recovery_id", "failure_stage", "error", "ended_at", "updated_at", "checkpoints"}
+    if ({k: v for k, v in current.items() if k not in mutable}
+            != {k: v for k, v in base.items() if k not in mutable}
+            or current.get("checkpoints", []) != [*base["checkpoints"], current.get("checkpoints", [{}])[-1]]
+            or current["checkpoints"][-1].get("stage") != "stopped"
+            or current.get("review_id") != event["review_id"] or current.get("recovery_id") != event["recovery_id"]
+            or current.get("review_status") != "UNCERTAIN" or current.get("failure_stage") != "review_recovery"
+            or current.get("error") != "Recovery review did not provide complete approval"):
+        raise ValueError("Completed continuation execution checkpoints are inconsistent")
+
+
 class ReviewRecovery:
     """Reuse BatchController dependencies/lock, never its coding/test/push loop."""
 
@@ -168,7 +246,8 @@ class ReviewRecovery:
 
     def _inspect(self, batch_id: str, task_id: str, repository: GitRepository,
                  lock: WorkspaceLock, *, recovery: dict | None = None,
-                 compatibility: CompatibilityRetry | None = None
+                 compatibility: CompatibilityRetry | None = None,
+                 continuation: TechnicalContinuation | None = None
                  ) -> tuple[FrozenPlan, Task, dict, dict, ReviewPacket, dict, dict | None]:
         plan = self.store.get_plan(batch_id)
         if plan is None:
@@ -186,7 +265,45 @@ class ReviewRecovery:
         previous = self.store.executions.recovery(task_id)
         second = self.store.executions.recovery(task_id, compatibility=True)
         failed = None
-        if compatibility is not None:
+        context = None
+        if continuation is not None:
+            audits = self.store.executions.recoveries(task_id)
+            if recovery is not None:
+                if not audits or audits[-1]["recovery_id"] != recovery["recovery_id"] or audits[-1]["stage"] != "reviewing":
+                    raise ValueError("Continuation claim differs from the active review")
+                audits = audits[:-1]
+            histories = self.store.reviews.list(task_id)
+            prior_reviews = histories[:-1] if recovery is not None else histories
+            if (not commit or not persisted_execution or not prior_reviews
+                    or continuation.fingerprint != plan.fingerprint or continuation.commit_sha != commit.commit_sha
+                    or continuation.branch != plan.to_dict()["expected_branch"]
+                    or continuation.failed_review_id != persisted_execution.get("review_id")
+                    or prior_reviews[-1]["review_id"] != continuation.failed_review_id
+                    or len(prior_reviews) != len(audits) + 1):
+                raise ValueError("Continuation authorization or review chain differs")
+            for position, event in enumerate(audits):
+                if (event.get("stage") != "finished" or event.get("decision") != "UNCERTAIN"
+                        or event.get("task_id") != task_id or event.get("batch_id") != batch_id
+                        or event.get("commit_sha") != commit.commit_sha
+                        or event.get("original_task") != asdict(task) or event.get("original_commit") != asdict(commit)
+                        or event.get("original_review") != prior_reviews[position]
+                        or event.get("original_review_id") != prior_reviews[position]["review_id"]
+                        or event.get("review_id") != prior_reviews[position + 1]["review_id"]
+                        or prior_reviews[position + 1].get("recovery_id") != event["recovery_id"]
+                        or prior_reviews[position + 1].get("config") != event["config"]
+                        or prior_reviews[position + 1].get("recovery_timestamp") != event["started_at"]
+                        or (event.get("technical_continuation") and
+                            (event["prior_recoveries"] != self.store.executions.signatures(audits[:position])
+                             or event["previous_reviews"] != prior_reviews[:position + 1]))
+                        or (event.get("compatibility_retry") and event["previous_recovery"] != audits[position - 1])):
+                    raise ValueError("Previous recovery audit or review history is inconsistent")
+                _stopped_after(event, audits[position + 1]["original_execution"]
+                               if position + 1 < len(audits) else persisted_execution)
+            context = {"prior_recoveries": self.store.executions.signatures(audits), "previous_reviews": prior_reviews}
+            failed = prior_reviews[-1]
+            execution = audits[0]["original_execution"] if audits else persisted_execution
+            attempt = self.store.executions.recovery_by_id(task_id, recovery["recovery_id"]) if recovery else None
+        elif compatibility is not None:
             if (compatibility.fingerprint != plan.fingerprint or not commit
                     or compatibility.commit_sha != commit.commit_sha
                     or compatibility.branch != plan.to_dict()["expected_branch"]
@@ -202,9 +319,10 @@ class ReviewRecovery:
             if not failed or failed["task_id"] != task_id or failed["commit_sha"] != commit.commit_sha:
                 raise ValueError("Exact failed review not found for the existing commit")
             execution = previous["original_execution"]
-        elif second is not None:
+        elif second is not None or self.store.executions.continuations(task_id):
             raise ValueError("Second technical recovery already claimed; no further retries are permitted")
-        attempt = second if compatibility is not None else previous
+        if continuation is None:
+            attempt = second if compatibility is not None else previous
         if attempt is not None and (recovery is None or attempt["recovery_id"] != recovery["recovery_id"]
                                     or attempt["stage"] != "reviewing"):
             raise ValueError("Recovery already claimed or completed; interrupted attempts require manual inspection")
@@ -232,7 +350,8 @@ class ReviewRecovery:
                 or not _duration(codex.get("duration_seconds"))):
             raise ValueError("Original successful Codex checkpoint is missing or invalid")
         original = self.store.reviews.get(execution.get("review_id", ""))
-        if (not original or original["task_id"] != task_id or original["commit_sha"] != commit.commit_sha
+        root_local = continuation is not None and original and original.get("error") == LOCAL_RATE_BLOCK
+        if not root_local and (not original or original["task_id"] != task_id or original["commit_sha"] != commit.commit_sha
                 or original.get("provider") != "GroqCloud"
                 or original.get("model") != self.config.model or original.get("reasoning_effort") != "medium"
                 or original.get("decision") != "UNCERTAIN" or original.get("confidence") != "LOW"
@@ -248,15 +367,21 @@ class ReviewRecovery:
             raise ValueError("Previous review is not an eligible zero-request technical preparation failure")
         histories = self.store.reviews.list(task_id)
         expected_ids = {original["review_id"]}
+        if context is not None:
+            if original != context["previous_reviews"][0]:
+                raise ValueError("Original implementation review differs from continuation history")
+            expected_ids = {r["review_id"] for r in context["previous_reviews"]}
         if compatibility is not None:
             if original != previous["original_review"]:
                 raise ValueError("Original preparation failure changed after the first recovery")
             expected_ids.add(failed["review_id"])
         if recovery is not None:
             if (persisted_execution != recovery["original_execution"]
-                    or (failed if compatibility is not None else original) != recovery["original_review"]
+                    or (failed if compatibility is not None or continuation is not None else original) != recovery["original_review"]
                     or (compatibility is not None and previous != recovery["previous_recovery"])):
                 raise ValueError("Original recovery evidence changed during review")
+            if context is not None and any(context[k] != recovery[k] for k in context):
+                raise ValueError("Continuation history changed during review")
             expected_ids.add(attempt["review_id"])
         if len(histories) != len(expected_ids) or {r["review_id"] for r in histories} != expected_ids:
             raise ValueError("Additional or conflicting review history requires manual inspection")
@@ -273,6 +398,8 @@ class ReviewRecovery:
             raise ValueError("Saved workspace binding changed during recovery")
         if compatibility is not None and binding != previous["original_binding"]:
             raise ValueError("Saved workspace binding changed after the first recovery")
+        if context is not None and any(event["original_binding"] != binding for event in audits):
+            raise ValueError("Saved workspace binding changed during continuation history")
         shas = []
         baseline = binding["initial_sha"]
         for earlier in definitions[:index]:
@@ -303,10 +430,21 @@ class ReviewRecovery:
                                      tests_commit_sha=commit.commit_sha, safety_passed=True)
         if compatibility is not None:
             _compatibility_failure(previous, persisted_execution, failed, packet)
-        return plan, task, persisted_execution, failed or original, packet, binding, previous if compatibility else None
+        if context is not None:
+            for position, review in enumerate(context["previous_reviews"]):
+                if review.get("error") == LOCAL_RATE_BLOCK:
+                    _local_failure(review, packet)
+                elif position == 0:
+                    continue  # The strict original zero-request preparation check above.
+                elif position == 1 and len(audits) > 1 and audits[1].get("compatibility_retry"):
+                    _compatibility_failure(audits[0], audits[1]["original_execution"], review, packet)
+                else:
+                    raise ValueError("A provider error or substantive judgment cannot be continued")
+        return plan, task, persisted_execution, failed or original, packet, binding, context or (previous if compatibility else None)
 
     def run(self, batch_id: str, directory: str | Path, *, task_id: str,
-            execute: bool = False, compatibility: CompatibilityRetry | None = None) -> RecoveryResult:
+            execute: bool = False, compatibility: CompatibilityRetry | None = None,
+            continuation: TechnicalContinuation | None = None) -> RecoveryResult:
         claimed = None
         persistence_uncertain = False
         sha = original_id = review_id = None
@@ -314,20 +452,26 @@ class ReviewRecovery:
         try:
             if type(execute) is not bool:
                 raise ValueError("Explicit boolean recovery authorization is required")
+            if compatibility is not None and continuation is not None:
+                raise ValueError("Choose either legacy compatibility recovery or technical continuation")
             repository = self.controller.single.repository_factory(directory)
             with self.controller.single.lock_factory(directory) as lock:
                 try:
                     plan, task, execution, original, packet, binding, previous = self._inspect(
-                        batch_id, task_id, repository, lock, compatibility=compatibility)
+                        batch_id, task_id, repository, lock, compatibility=compatibility, continuation=continuation)
                     sha, original_id = packet.commit_sha, original["review_id"]
                     try:
-                        planned = plan_chunks(packet, self.config)
+                        planned = provider_plan(packet, self.config, self.store.reviews.latest_limits(self.config.model))
                         expected, sizing = planned.chunks, planned.diagnostics
                     except ReviewError as exc:
                         sizing = exc.diagnostics
                         if not execute:
                             raise
                         expected = None  # Reviewer records a new UNCERTAIN attempt, without I/O.
+                    if expected and rate_blocked(self.store.reviews.latest_limits(self.config.model),
+                            request_tokens(request_arguments(self.config, template(), expected[0].content),
+                                           headroom=self.config.headroom)):
+                        raise ValueError(LOCAL_RATE_BLOCK)
                     if not execute:
                         return RecoveryResult(batch_id, task_id, True, False, sha, original_id,
                                               diagnostics=sizing)
@@ -336,7 +480,8 @@ class ReviewRecovery:
                         raise ValueError("GROQ_API_KEY is unavailable; no recovery was claimed")
                     claimed = self.store.claim_review_recovery(
                         plan, task, execution, original, asdict(self.config), binding,
-                        previous_recovery=previous)
+                        previous_recovery=previous if continuation is None else None,
+                        continuation=previous if continuation is not None else None)
                     with self.controller.reviewer_factory(self.store, config=self.config) as reviewer:
                         result = reviewer.review(packet, recovery_id=claimed["recovery_id"])
                     if not isinstance(result, ReviewResult):
@@ -356,7 +501,7 @@ class ReviewRecovery:
                         raise ValueError("Recovery approval lacks exact complete evidence coverage")
                     # Reverify source bytes, parent chain, remote SHA and all durable identity.
                     current = self._inspect(batch_id, task_id, repository, lock, recovery=claimed,
-                                            compatibility=compatibility)
+                                            compatibility=compatibility, continuation=continuation)
                     if current[0] != plan or current[4] != packet:
                         raise ValueError("Frozen plan or review evidence changed during recovery")
                     self.store.finish_review_recovery(task_id, claimed["recovery_id"], review_id, persisted)

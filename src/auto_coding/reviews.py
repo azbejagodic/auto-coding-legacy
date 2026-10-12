@@ -124,6 +124,9 @@ class ReviewDiagnostics:
     max_chunks: int
     total_budget: int
     limiting_factor: str | None = None
+    provider_token_limit: int | None = None
+    estimated_total_tokens: int | None = None
+    largest_request_tokens: int | None = None
 
 
 @dataclass(frozen=True)
@@ -332,13 +335,18 @@ def build_chunks(packet: ReviewPacket, config: ReviewConfig, *,
 
 
 def plan_chunks(packet: ReviewPacket, config: ReviewConfig, *,
-                instructions: str | None = None) -> ReviewPlan:
+                instructions: str | None = None,
+                token_counter: Callable[[dict], int] | None = None,
+                token_limit: int | None = None) -> ReviewPlan:
     """Byte upper-bound estimate, including schema/messages and output reserve.
 
     Preserve files/hunks where possible, then partition oversized hunks at
     complete diff lines with separately labeled context and exact coverage.
     """
     validate_packet(packet)
+    if (token_counter is None) != (token_limit is None) or (
+            token_limit is not None and (type(token_limit) is not int or token_limit <= 0)):
+        raise ReviewError("A valid paired provider tokenizer and token limit are required")
     instructions = template() if instructions is None else instructions
     if sanitize(instructions)[1]:
         raise ReviewError("Sensitive review instructions withheld")
@@ -396,6 +404,16 @@ def plan_chunks(packet: ReviewPacket, config: ReviewConfig, *,
 
     _, whole_size = make(sections, 1, 1)
 
+    def tokens(items, count=None, index=None):
+        if token_counter is None:
+            return None
+        content = make(items, count, index)[0]
+        return token_counter(request_arguments(config, instructions, content))
+
+    def fits(items, count=None, index=None):
+        return (make(items, count, index)[1] <= config.request_budget
+                and (token_counter is None or tokens(items, count, index) <= token_limit))
+
     def diagnostics(groups: list[list[dict]] | None, limit: str | None = None) -> ReviewDiagnostics:
         sizes = ([make(group, len(groups), i)[1] for i, group in enumerate(groups, 1)]
                  if groups else [])
@@ -407,31 +425,36 @@ def plan_chunks(packet: ReviewPacket, config: ReviewConfig, *,
             len(groups) if groups else None, sum(sizes) if sizes else None,
             sum(overhead[1:]) if overhead else None, max(sizes, default=whole_size),
             config.request_budget, config.max_chunks, config.max_review_tokens, limit,
+            token_limit,
+            sum(tokens(group, len(groups), i) for i, group in enumerate(groups, 1))
+            if token_counter and groups else None,
+            max(tokens(group, len(groups), i) for i, group in enumerate(groups, 1))
+            if token_counter and groups else tokens(sections, 1, 1),
         )
 
     groups: list[list[dict]] = []
     expected_sections = sections
-    if whole_size <= config.request_budget:
+    if fits(sections, 1, 1):
         groups = [sections]
     else:
-        if make([])[1] > config.request_budget:
+        if not fits([]):
             raise ReviewError("Essential review evidence exceeds the safe request budget",
                               diagnostics=diagnostics(None, "essential_request_budget"))
         expected_sections = []
         group: list[dict] = []
 
         def units(file_sections: list[dict]) -> Iterator[list[dict]]:
-            if make(file_sections)[1] <= config.request_budget:
+            if fits(file_sections):
                 yield file_sections
                 return
             for section in file_sections:
-                if make([section])[1] <= config.request_budget:
+                if fits([section]):
                     yield [section]
                     continue
                 try:
                     parts = _split_hunk(
-                        section, lambda items: make(items)[1] <= config.request_budget,
-                        first_fits=lambda items: make([*group, *items])[1] <= config.request_budget,
+                        section, fits,
+                        first_fits=lambda items: fits([*group, *items]),
                     )
                 except ReviewError as exc:
                     raise ReviewError(str(exc), diagnostics=diagnostics(None, "request_budget")) from None
@@ -443,7 +466,7 @@ def plan_chunks(packet: ReviewPacket, config: ReviewConfig, *,
             file_sections = [s for s in sections if s["section_id"].startswith(f"{file_index}:")]
             for unit in units(file_sections):
                 expected_sections.extend(unit)
-                if group and make([*group, *unit])[1] > config.request_budget:
+                if group and not fits([*group, *unit]):
                     groups.append(group)
                     group = []
                 group.extend(unit)
@@ -454,7 +477,7 @@ def plan_chunks(packet: ReviewPacket, config: ReviewConfig, *,
     chunks = []
     for index, group in enumerate(groups, 1):
         content, size = make(group, len(groups), index)
-        if size > config.request_budget:
+        if not fits(group, len(groups), index):
             raise ReviewError("Final review request exceeds the safe request budget",
                               diagnostics=diagnostics(groups, "request_budget"))
         identity = hashlib.sha256(content.encode("utf-8")).hexdigest()
@@ -462,7 +485,9 @@ def plan_chunks(packet: ReviewPacket, config: ReviewConfig, *,
     coverage = [section for chunk in chunks for section in chunk.coverage]
     if coverage != [section["section_id"] for section in expected_sections] or len(set(coverage)) != len(coverage):
         raise ReviewError("Incomplete or duplicate diff coverage")
-    if sum(chunk.estimated_tokens for chunk in chunks) > config.max_review_tokens:
+    total = (sum(tokens(group, len(groups), i) for i, group in enumerate(groups, 1))
+             if token_counter else sum(chunk.estimated_tokens for chunk in chunks))
+    if total > config.max_review_tokens:
         raise ReviewError("Total review allowance would be exceeded",
                           diagnostics=diagnostics(groups, "max_review_tokens"))
     return ReviewPlan(tuple(chunks), diagnostics(groups))

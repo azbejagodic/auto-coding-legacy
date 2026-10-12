@@ -38,7 +38,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--review-budget", type=int, default=ReviewConfig.request_budget,
                      help="conservative per-request wire budget including reserved output")
     run.add_argument("--review-token-limit", type=int, default=ReviewConfig.max_review_tokens,
-                     help="maximum conservative total budget per review")
+                     help="maximum total local tokenizer estimate for Groq, including output reserves")
     run.add_argument("--execute", action="store_true", help="explicitly authorize real execution")
     retry = batches.add_parser("review-retry", help="preflight or explicitly retry one technical review stop")
     retry.add_argument("batch_id")
@@ -50,6 +50,8 @@ def build_parser() -> argparse.ArgumentParser:
     retry.add_argument("--execute", action="store_true", help="authorize one review only; never coding or push")
     retry.add_argument("--retry-api-compatibility", action="store_true",
                        help="explicitly select the single second recovery for the legacy unsupported-store error")
+    retry.add_argument("--continue-technical", action="store_true",
+                       help="explicitly review a completed local capacity block, preserving all attempts")
     retry.add_argument("--failed-review-id")
     retry.add_argument("--expected-fingerprint")
     retry.add_argument("--expected-sha")
@@ -117,18 +119,24 @@ def main(argv: list[str] | None = None) -> int:
             from .batch_controller import BatchController
             config = ReviewConfig(request_budget=args.review_budget, max_review_tokens=args.review_token_limit)
             if args.batch_command == "review-retry":
-                from .review_recovery import CompatibilityRetry
+                from .review_recovery import CompatibilityRetry, TechnicalContinuation
                 compatibility = None
+                continuation = None
                 identities = (args.failed_review_id, args.expected_fingerprint,
                               args.expected_sha, args.expected_branch)
-                if args.retry_api_compatibility:
+                if args.retry_api_compatibility and args.continue_technical:
+                    raise ValueError("Choose only one review recovery mode")
+                if args.retry_api_compatibility or args.continue_technical:
                     if not all(identities):
-                        print("Second recovery requires --failed-review-id, --expected-fingerprint, "
+                        print("Technical recovery requires --failed-review-id, --expected-fingerprint, "
                               "--expected-sha and --expected-branch; nothing was changed.", file=sys.stderr)
                         return 1
-                    compatibility = CompatibilityRetry(*identities)
+                    if args.continue_technical:
+                        continuation = TechnicalContinuation(*identities)
+                    else:
+                        compatibility = CompatibilityRetry(*identities)
                 elif any(identities):
-                    print("Second recovery bindings require --retry-api-compatibility.", file=sys.stderr)
+                    print("Recovery bindings require --retry-api-compatibility or --continue-technical.", file=sys.stderr)
                     return 1
                 # Inspect an existing database read-only even when execution was
                 # requested. No migration/write precedes the verified preflight.
@@ -136,6 +144,7 @@ def main(argv: list[str] | None = None) -> int:
                     preflight = BatchController(store, review_config=config).review_retry(
                         args.batch_id, args.repo, task_id=args.task,
                         compatibility=compatibility,
+                        continuation=continuation,
                     )
                 if not args.execute or not preflight.success:
                     result = preflight
@@ -144,6 +153,7 @@ def main(argv: list[str] | None = None) -> int:
                         result = BatchController(store, review_config=config).review_retry(
                             args.batch_id, args.repo, task_id=args.task, execute=True,
                             compatibility=compatibility,
+                            continuation=continuation,
                         )
                 print(f"Review recovery {'attempt' if result.executed else 'preflight'}: "
                       f"batch={result.batch_id}; task={result.task_id}; "
@@ -154,12 +164,17 @@ def main(argv: list[str] | None = None) -> int:
                     size = result.diagnostics
                     print(f"Review sizing (conservative units, NOT API tokens): "
                           f"chunks={size.chunk_count if size.chunk_count is not None else 'unknown'}/{size.max_chunks}; "
-                          f"estimated total={size.estimated_total_units if size.estimated_total_units is not None else 'unknown'}/{size.total_budget}; "
+                          f"estimated total={size.estimated_total_units if size.estimated_total_units is not None else 'unknown'}"
+                          f"{'/' + str(size.total_budget) if size.provider_token_limit is None else ' wire units'}; "
                           f"largest request={size.largest_request_units}/{size.request_budget}; "
                           f"essential JSON bytes={size.essential_json_bytes}; "
                           f"essential request={size.essential_request_units}; diff bytes={size.diff_bytes}; "
                           f"repeated overhead={size.repeated_overhead_units if size.repeated_overhead_units is not None else 'unknown'}; "
                           f"limiting factor={size.limiting_factor or 'none'}")
+                    if size.provider_token_limit is not None:
+                        print(f"Provider sizing (local tokenizer estimates, NOT reported usage): "
+                              f"largest={size.largest_request_tokens}/{size.provider_token_limit}; "
+                              f"total={size.estimated_total_tokens}/{size.total_budget}; estimated tokens")
                 if result.error:
                     print(result.error, file=sys.stderr)
                 return 0 if result.success else 1

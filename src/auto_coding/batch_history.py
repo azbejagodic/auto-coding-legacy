@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import sqlite3
 
 from .review_history import utc_now
 from .review_security import sanitize
+from .reviews import encoded
 
 
 def initialize_batch_schema(connection: sqlite3.Connection) -> None:
@@ -35,6 +37,14 @@ def initialize_batch_schema(connection: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS review_compatibility_recoveries (
             task_id TEXT PRIMARY KEY REFERENCES review_recoveries(task_id),
             recovery_id TEXT UNIQUE NOT NULL,
+            record_json TEXT NOT NULL
+        )
+    """)
+    connection.execute("""
+        CREATE TABLE IF NOT EXISTS review_continuations (
+            task_id TEXT NOT NULL REFERENCES task_executions(task_id),
+            recovery_id TEXT PRIMARY KEY NOT NULL,
+            parent_review_id TEXT UNIQUE NOT NULL REFERENCES reviews(review_id),
             record_json TEXT NOT NULL
         )
     """)
@@ -88,20 +98,46 @@ class BatchHistory:
         return record
 
     def recovery_by_id(self, task_id: str, recovery_id: str) -> dict | None:
-        matches = [record for second in (False, True)
-                   if (record := self.recovery(task_id, compatibility=second)) is not None
-                   and record["recovery_id"] == recovery_id]
+        matches = [record for record in self.recoveries(task_id) if record["recovery_id"] == recovery_id]
         if len(matches) > 1:
             raise ValueError("Conflicting recovery audit identities")
         return matches[0] if matches else None
+
+    def continuations(self, task_id: str) -> list[dict]:
+        if not self._connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE name = 'review_continuations'"
+        ).fetchone():
+            return []
+        result = []
+        for row in self._connection.execute("SELECT * FROM review_continuations WHERE task_id = ? "
+                                            "ORDER BY rowid", (task_id,)):
+            record = json.loads(row["record_json"])
+            if (record.get("task_id") != row["task_id"] or record.get("recovery_id") != row["recovery_id"]
+                    or record.get("original_review_id") != row["parent_review_id"]):
+                raise ValueError("Continuation audit identity is inconsistent")
+            result.append(record)
+        return result
+
+    def recoveries(self, task_id: str) -> list[dict]:
+        return [record for second in (False, True)
+                if (record := self.recovery(task_id, compatibility=second)) is not None] + self.continuations(task_id)
+
+    @staticmethod
+    def signatures(records: list[dict]) -> list[dict]:
+        # Pin complete previous audits without recursively copying their snapshots.
+        return [{"recovery_id": record["recovery_id"],
+                 "sha256": hashlib.sha256(encoded(record).encode()).hexdigest()} for record in records]
 
     def _save_recovery(self, record: dict) -> None:
         matches = [second for second in (False, True)
                    if (saved := self.recovery(record["task_id"], compatibility=second)) is not None
                    and saved["recovery_id"] == record["recovery_id"]]
-        if len(matches) != 1:
+        continued = [saved for saved in self.continuations(record["task_id"])
+                     if saved["recovery_id"] == record["recovery_id"]]
+        if len(matches) + len(continued) != 1:
             raise ValueError("Recovery audit record disappeared or is ambiguous")
-        table = "review_compatibility_recoveries" if matches[0] else "review_recoveries"
+        table = ("review_continuations" if continued else
+                 "review_compatibility_recoveries" if matches[0] else "review_recoveries")
         safe, _ = sanitize(record)
         cursor = self._connection.execute(
             f"UPDATE {table} SET record_json = ? WHERE task_id = ? AND recovery_id = ?",

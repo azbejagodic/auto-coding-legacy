@@ -52,7 +52,7 @@ remain unchanged. See [budget measurements](groq-reviews.md#practical-budgeting-
 Ordinary recovery allows only one durably claimed attempt per stopped task.
 TASK-011-GROQ-API-FIX adds one explicitly identity-bound second technical attempt
 only for the historical completed unsupported-`store` HTTP failure. There is no
-third attempt or retry of a substantive judgment. Interrupted/nonapproving
+third compatibility attempt or retry of a substantive judgment. Interrupted/nonapproving
 attempts require manual reconciliation; no atomic transaction spans provider
 delivery and SQLite.
 Preflight performs read-only remote queries and uses the existing external OS
@@ -67,6 +67,22 @@ HTTP failures retain safe status/type/code/rate-limit diagnostics. Removing
 model availability, token allowance or approval. No live request or recovery was
 run for this fix, and the real SQLite database/target repository remain untouched.
 See the [second-recovery procedure](batch-execution.md#one-second-technical-recovery-for-the-unsupported-groq-parameter).
+
+TASK-011-GROQ-RUNTIME-FIX resolves the subsequent permanent local rate block:
+the original timestamp was valid, but `1ms` resets were unrecognized and wire
+units were compared to actual provider token allowance. Runtime requests now
+use offline GPT-OSS token estimates and a provider ceiling as well as wire-byte
+bounds. Tokenizer framing is still an estimate; organization-wide use and limits
+not exposed in headers can still produce HTTP/429 failures. No automatic resend
+is made. Missing/invalid timestamps or unknown exhausted resets still stop for
+inspection. Subsequent chunk waits are bounded to 60 seconds.
+Completed local blocks now support explicit identity-bound technical
+continuation, preserving every audit/review. Unknown delivery, provider errors,
+substantive judgments, unresolved findings and interrupted audits remain
+ineligible. No live API/recovery or website repository mutation was performed;
+the real database was inspected and packet-sized read-only with hash verification.
+See [runtime handling](groq-reviews.md#runtime-token-sizing-and-rate-limits-task-011-groq-runtime-fix)
+and [continuation](batch-execution.md#explicit-technical-review-only-continuation).
 
 ## Existing lock-termination test with Windows venv redirectors
 
