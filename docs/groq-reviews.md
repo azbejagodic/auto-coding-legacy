@@ -139,8 +139,8 @@ authorization to bypass its own tests, locks, state checks or Git safeguards.
 
 - Model `openai/gpt-oss-120b`; reasoning `medium` (`low`/`high` configurable).
 - Timeout 45 seconds; SDK retries explicitly zero.
-- Request budget 6,000; output/reasoning reservation 1,536; headroom 512.
-- At most 16 chunks and 30,000 estimated tokens across the whole review.
+- Request budget 30,000; output/reasoning reservation 1,536; headroom 512.
+- At most 16 chunks and 30,000 conservative units across the whole review.
 
 Input is conservatively estimated using UTF-8 bytes of serialized request
 arguments (including the schema/instructions/messages), not the common
@@ -151,6 +151,9 @@ limits; do not equate tokens-per-minute with safe per-request input capacity.
 
 A complete small diff uses one request. Larger diffs keep whole files together
 where possible, otherwise split at validated unified-diff hunk boundaries.
+When a hunk already requires fragmentation, its first fragment fills remaining
+space in the current request if a complete line and required context fit. Whole
+files/hunks that fit are not fragmented merely to fill spare space.
 An oversized hunk is partitioned at complete LF-delimited diff lines; CRLF,
 Unicode source and Git no-final-newline markers are retained exactly. A marker
 stays attached to its preceding line. No source line is split or rewritten.
@@ -182,6 +185,51 @@ Every candidate and final request is measured with the complete serialized
 schema, instructions, repeated requirements/configuration/tests/manifest,
 section metadata and overlap, plus output reservation and headroom. Chunk
 count/index sizing is conservative. No limits are increased by fragmentation.
+
+### Practical budgeting (TASK-011-GROQ-UNBLOCK)
+
+The prior batch default of 12,000 units left only about 1,000 units for diff
+evidence in the reported first real task: every independent request repeated
+the full requirements, tests, configuration, manifest, instructions/schema,
+JSON escaping and output/headroom. Splitting isolated hunks without accounting
+for spare room also stranded capacity. CLI overrides were correctly propagated;
+80,000 was simply below the calculated total of 85,158.
+
+Read-only measurements for commit `80c9098dc8cd084e97f1769d53b3cf06354c4e7f`:
+
+- Six files, 623 inserted lines; complete patches total 16,129 UTF-8 bytes.
+- Essential JSON: 5,535 bytes (prompt 3,469, criteria 431, configuration 329,
+  tests 962; remaining identity/field names account for the rest).
+- Empty-diff request including all repeated essentials/instructions/schema and
+  output/headroom: 10,946 conservative units.
+
+| Planner/settings (request / total) | Chunks | Estimated total units | Result |
+| --- | ---: | ---: | --- |
+| Previous, 12,000 / 30,000 | 65 | 778,014 | Chunk limit |
+| Previous, 16,000 / 80,000 | 6 | 85,158 | Total limit |
+| Improved packing, 16,000 / 80,000 | 5 | 74,252 | Fits |
+| New default, 30,000 / 30,000 | 1 | 29,419 | Fits |
+
+The new default request ceiling matches the **unchanged total cap**, removing
+cross-request repetition by reviewing a practical complete commit together.
+It does not use a less conservative tokenizer heuristic, increase total
+allowance/chunk/output limits, omit evidence, or override explicit smaller
+settings. Commits above the unchanged total cap can still be refused.
+`plan_chunks` returns the same chunks as `build_chunks`, plus size-only
+diagnostics; budget errors carry those diagnostics too. Recovery preflight
+prints them without SQLite writes or model calls. New executed review records
+retain them as `budget_diagnostics`; existing history is not rewritten.
+
+The historical `estimated_tokens` request field contains conservative planning
+units (serialized UTF-8 bytes plus reserves), **not provider-reported tokens**.
+Only validated provider usage contributes to usage totals. HTTP JSON escaping
+is deliberately counted, although it is not itself a token-usage measurement.
+The existing provider-header gate, 429 handling, zero retries and stop-on-error
+behavior remain unchanged. Account limits are independent of this local cap;
+a packet fitting preflight is not a promise that Groq will accept or approve it.
+See [Groq rate-limit documentation](https://console.groq.com/docs/rate-limits).
+No live review or actual recovery was run while measuring this packet; the
+database and implementation repository were not modified.
 
 The previous combined oversized-hunk/essential-evidence error could arise from
 either a long hunk or large repeated essential evidence (or both); a commit's

@@ -80,8 +80,8 @@ class BatchController:
             raise ValueError("Controllers must share the same caller-owned store")
         self.reviewer_factory = reviewer_factory
         # Frozen configuration adds essential context. Keep the existing reviewer
-        # and model/effort defaults, with an explicit bounded batch wire budget.
-        self.review_config = review_config or ReviewConfig(request_budget=12000)
+        # and model/effort defaults, with the same bounded review wire budget.
+        self.review_config = review_config or ReviewConfig()
 
     def review_retry(self, batch_id: str, working_directory: str | Path, *,
                      task_id: str, execute: bool = False) -> RecoveryResult:

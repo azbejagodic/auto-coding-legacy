@@ -9,6 +9,7 @@ import sys
 from .diagnostics import run_doctor
 from .logging_config import configure_logging
 from .plans import PlanConflictError, PlanValidationError, load_plan
+from .reviews import ReviewConfig
 from .storage import TaskStore
 
 
@@ -34,9 +35,9 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--db", required=True)
     run.add_argument("--repo", required=True)
     run.add_argument("--max-tasks", type=int)
-    run.add_argument("--review-budget", type=int, default=12000,
+    run.add_argument("--review-budget", type=int, default=ReviewConfig.request_budget,
                      help="conservative per-request wire budget including reserved output")
-    run.add_argument("--review-token-limit", type=int, default=30000,
+    run.add_argument("--review-token-limit", type=int, default=ReviewConfig.max_review_tokens,
                      help="maximum conservative total budget per review")
     run.add_argument("--execute", action="store_true", help="explicitly authorize real execution")
     retry = batches.add_parser("review-retry", help="preflight or explicitly retry one technical review stop")
@@ -44,8 +45,8 @@ def build_parser() -> argparse.ArgumentParser:
     retry.add_argument("--db", required=True)
     retry.add_argument("--repo", required=True)
     retry.add_argument("--task", required=True)
-    retry.add_argument("--review-budget", type=int, default=12000)
-    retry.add_argument("--review-token-limit", type=int, default=30000)
+    retry.add_argument("--review-budget", type=int, default=ReviewConfig.request_budget)
+    retry.add_argument("--review-token-limit", type=int, default=ReviewConfig.max_review_tokens)
     retry.add_argument("--execute", action="store_true", help="authorize one review only; never coding or push")
     return parser
 
@@ -108,7 +109,6 @@ def main(argv: list[str] | None = None) -> int:
                                     print(f"    {execution['error']}")
                 return 0
             from .batch_controller import BatchController
-            from .reviews import ReviewConfig
             config = ReviewConfig(request_budget=args.review_budget, max_review_tokens=args.review_token_limit)
             if args.batch_command == "review-retry":
                 # Inspect an existing database read-only even when execution was
@@ -129,6 +129,16 @@ def main(argv: list[str] | None = None) -> int:
                       f"{'approved' if result.executed and result.success else 'eligible' if result.success else 'blocked'}; "
                       f"SHA={result.commit_sha or '-'}; original review={result.original_review_id or '-'}; "
                       f"new review={result.review_id or '-'}; decision={result.decision or '-'}")
+                if result.diagnostics is not None:
+                    size = result.diagnostics
+                    print(f"Review sizing (conservative units, NOT API tokens): "
+                          f"chunks={size.chunk_count if size.chunk_count is not None else 'unknown'}/{size.max_chunks}; "
+                          f"estimated total={size.estimated_total_units if size.estimated_total_units is not None else 'unknown'}/{size.total_budget}; "
+                          f"largest request={size.largest_request_units}/{size.request_budget}; "
+                          f"essential JSON bytes={size.essential_json_bytes}; "
+                          f"essential request={size.essential_request_units}; diff bytes={size.diff_bytes}; "
+                          f"repeated overhead={size.repeated_overhead_units if size.repeated_overhead_units is not None else 'unknown'}; "
+                          f"limiting factor={size.limiting_factor or 'none'}")
                 if result.error:
                     print(result.error, file=sys.stderr)
                 return 0 if result.success else 1

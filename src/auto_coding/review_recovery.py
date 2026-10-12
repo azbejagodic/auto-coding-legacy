@@ -14,7 +14,7 @@ from .integrations.git import GitError, GitRepository
 from .integrations.groq import GroqReviewer
 from .plans import FrozenPlan
 from .review_evidence import build_review_packet
-from .reviews import ReviewError, ReviewPacket, ReviewResult, SHA, build_chunks, encoded
+from .reviews import ReviewDiagnostics, ReviewError, ReviewPacket, ReviewResult, SHA, encoded, plan_chunks
 from .storage import PushState, Task, TaskStatus
 from .test_runner import CommandResult, TestRunResult
 from .workspace_lock import WorkspaceLock, WorkspaceLockError
@@ -52,6 +52,7 @@ class RecoveryResult:
     review_id: str | None = None
     decision: str | None = None
     error: str | None = None
+    diagnostics: ReviewDiagnostics | None = None
 
 
 def _duration(value: object) -> bool:
@@ -202,6 +203,7 @@ class ReviewRecovery:
         claimed = None
         persistence_uncertain = False
         sha = original_id = review_id = None
+        sizing = None
         try:
             if type(execute) is not bool:
                 raise ValueError("Explicit boolean recovery authorization is required")
@@ -212,13 +214,16 @@ class ReviewRecovery:
                         batch_id, task_id, repository, lock)
                     sha, original_id = packet.commit_sha, original["review_id"]
                     try:
-                        expected = build_chunks(packet, self.config)
-                    except ReviewError:
+                        planned = plan_chunks(packet, self.config)
+                        expected, sizing = planned.chunks, planned.diagnostics
+                    except ReviewError as exc:
+                        sizing = exc.diagnostics
                         if not execute:
                             raise
                         expected = None  # Reviewer records a new UNCERTAIN attempt, without I/O.
                     if not execute:
-                        return RecoveryResult(batch_id, task_id, True, False, sha, original_id)
+                        return RecoveryResult(batch_id, task_id, True, False, sha, original_id,
+                                              diagnostics=sizing)
                     if (self.controller.reviewer_factory is GroqReviewer
                             and not os.environ.get("GROQ_API_KEY", "").strip()):
                         raise ValueError("GROQ_API_KEY is unavailable; no recovery was claimed")
@@ -250,6 +255,7 @@ class ReviewRecovery:
                         batch_id, task_id, result.eligible_to_proceed, True, sha, original_id,
                         claimed["recovery_id"], review_id, result.decision,
                         None if result.eligible_to_proceed else result.error or "Recovery review did not approve; task blocked",
+                        diagnostics=sizing,
                     )
                 except BaseException as exc:
                     if claimed:
@@ -268,4 +274,5 @@ class ReviewRecovery:
             if persistence_uncertain:
                 error += "; audit persistence failed; recovery state is uncertain"
             return RecoveryResult(batch_id, task_id, False, claimed is not None, sha, original_id,
-                                  claimed["recovery_id"] if claimed else None, review_id, error=error)
+                                  claimed["recovery_id"] if claimed else None, review_id, error=error,
+                                  diagnostics=sizing)

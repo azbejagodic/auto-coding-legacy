@@ -43,8 +43,12 @@ implementation. See [batch execution](batch-execution.md) and [task plans](task-
 TASK-011-RECOVERY does not reconcile the real `VISUAL-BOARD-BATCH-002` stopped
 review. Its committed/pushed task and history must remain untouched until a
 separately authorized review-only recovery; see the [recovery procedure](batch-execution.md#explicit-review-only-recovery-task-011-recovery).
-Generic offline coverage does not guarantee that this particular packet fits the
-unchanged 12000 per-request and 30000 total conservative budgets.
+TASK-011-GROQ-UNBLOCK measured that packet read-only: a complete single request
+fits 29,419 conservative units under the aligned 30,000 request/total defaults.
+This is not provider token usage, recovery authorization, a remote-state check
+or an approval. Larger commits, provider limits and model uncertainty can still
+block review; the total cap, coverage requirements and fail-closed behavior
+remain unchanged. See [budget measurements](groq-reviews.md#practical-budgeting-task-011-groq-unblock).
 Recovery allows only one durably claimed attempt per stopped task. Interrupted
 or nonapproving attempts require manual reconciliation; there is no retry of a
 recovery or atomic transaction spanning provider delivery and SQLite.

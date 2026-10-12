@@ -76,10 +76,12 @@ Missing `--execute` launches nothing. Return codes: 0 completed/controlled limit
 1 safely stopped, 2 invalid CLI syntax, 130 keyboard interruption.
 
 The Groq model/effort remain `openai/gpt-oss-120b` / `medium`, timeout 45 seconds,
-zero retries. Batch reviews use a 12000 per-request conservative wire budget
+zero retries. Batch reviews use a 30000 per-request conservative wire budget
 (UTF-8 byte upper bound plus output/headroom), with the existing 30000 total
 review budget and chunk limit. Full frozen configuration needs more essential
-context than standalone legacy tasks. Override with `--review-budget` and
+context than standalone legacy tasks. A complete commit fitting the existing
+total allowance is reviewed together, without duplicating that evidence across
+many tiny requests. Override with `--review-budget` and
 `--review-token-limit` before starting, or pass a `ReviewConfig` to
 `BatchController`. These budgets are not exact token/account quota estimates.
 Oversized hunks split losslessly into line-bounded primary sections with labeled
@@ -204,12 +206,21 @@ Missing or inconsistent records require manual investigation, not invented
 passing results or automatic retesting.
 
 Model/effort remain `openai/gpt-oss-120b` / `medium`, timeout 45 seconds, zero
-SDK retries, 12000 per-request/30000 total conservative budgets and 16 chunks.
+SDK retries, 30000 per-request/30000 total conservative budgets and 16 chunks.
 Explicit `--review-budget` and `--review-token-limit` match normal batch options;
 no limits increase automatically. CLI preflight blocks evidence that still cannot
 fit. A programmatic authorized attempt encountering a budget error records a new
 UNCERTAIN result without API I/O. Return codes: 0 eligible preflight/approved
 recovery, 1 blocked/nonapproval, 2 syntax error, 130 interrupted.
+
+Preflight also prints size-only diagnostics on success and budget failure:
+essential JSON bytes, essential request overhead, diff bytes, estimated chunk
+count/total, repeated overhead, largest request and the limiting configuration
+field. These conservative units are **not API tokens** or account quota.
+An unknown count/total means planning could not finish (for example, essentials
+or an indivisible line cannot fit); it does not mean zero evidence or zero cost.
+No prompt, source, test output or secret is printed. See the measured
+[practical budgeting regression](groq-reviews.md#practical-budgeting-task-011-groq-unblock).
 
 An atomic unique `review_recoveries` claim precedes review. It retains the
 original stopped execution/review, task/commit/workspace-binding snapshots,
@@ -249,6 +260,8 @@ including after restart. Inspect the audit event, both reviews, Git and processe
 do not delete rows, reset statuses or seek another approval. No automatic recovery
 of a recovery is implemented. Network and SQLite are not one transaction; crashes
 after provider delivery can leave unknown usage requiring manual reconciliation.
-The real batch/database was not inspected, so its eligibility and budget fit
-remain unverified. This task made no live model requests or changes to
+TASK-011-RECOVERY did not inspect the real batch/database. TASK-011-GROQ-UNBLOCK
+subsequently measured its packet read-only: it fits the new default size plan,
+but actual recovery eligibility, remote state and provider approval remain
+unverified. Neither task made live model requests or changes to
 `auto-coding-test`.

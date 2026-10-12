@@ -8,7 +8,7 @@ import hashlib
 import json
 import math
 import re
-from typing import Any, Callable
+from typing import Any, Callable, Iterator
 
 from .review_security import sanitize, validate_review_path
 
@@ -34,6 +34,10 @@ RESPONSE_SCHEMA = {
 class ReviewError(ValueError):
     """Sanitized, predictable review failure."""
 
+    def __init__(self, message: str, *, diagnostics: ReviewDiagnostics | None = None):
+        super().__init__(message)
+        self.diagnostics = diagnostics
+
 
 def encoded(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False)
@@ -48,7 +52,9 @@ class ReviewConfig:
     model: str = "openai/gpt-oss-120b"
     reasoning_effort: str = "medium"
     timeout: float = 45.0
-    request_budget: int = 6000
+    # One practical commit can use the existing total allowance without paying
+    # repeated essential evidence overhead. Explicit lower limits still apply.
+    request_budget: int = 30000
     output_tokens: int = 1536
     headroom: int = 512
     max_chunks: int = 16
@@ -101,6 +107,29 @@ class ReviewChunk:
     coverage: tuple[str, ...]
     content: str
     estimated_tokens: int
+
+
+@dataclass(frozen=True)
+class ReviewDiagnostics:
+    """Size-only diagnostics: conservative units, never actual API usage."""
+
+    essential_json_bytes: int
+    essential_request_units: int
+    diff_bytes: int
+    chunk_count: int | None
+    estimated_total_units: int | None
+    repeated_overhead_units: int | None
+    largest_request_units: int
+    request_budget: int
+    max_chunks: int
+    total_budget: int
+    limiting_factor: str | None = None
+
+
+@dataclass(frozen=True)
+class ReviewPlan:
+    chunks: tuple[ReviewChunk, ...]
+    diagnostics: ReviewDiagnostics
 
 
 @dataclass(frozen=True)
@@ -230,7 +259,8 @@ def _diff_lines(text: str) -> list[str]:
     return [part + "\n" for part in parts[:-1]] + ([parts[-1]] if parts[-1] else [])
 
 
-def _split_hunk(section: dict, fits: Callable[[list[dict]], bool]) -> list[dict]:
+def _split_hunk(section: dict, fits: Callable[[list[dict]], bool], *,
+                first_fits: Callable[[list[dict]], bool] | None = None) -> list[dict]:
     """Partition primary evidence; repeated neighbors are explicitly context only."""
     lines = _diff_lines(section["body"])
     match = _HUNK_HEADER.fullmatch(lines[0]) if lines else None
@@ -274,12 +304,16 @@ def _split_hunk(section: dict, fits: Callable[[list[dict]], bool]) -> list[dict]
         # With a fixed first boundary, primary+following context grows
         # monotonically. Measure the actual serialized request, not raw text.
         low, high = first + 1, len(boundaries) - 1
-        if not fits([fragment(first, low)]):
+        # An already oversized hunk can fill the previous chunk's spare room.
+        # If even its first complete line cannot fit there, start a new chunk.
+        fits_here = (first_fits if first == 0 and first_fits is not None
+                     and first_fits([fragment(first, low)]) else fits)
+        if not fits_here([fragment(first, low)]):
             raise ReviewError("A diff line or required hunk context exceeds the safe request budget")
         best = low
         while low <= high:
             middle = (low + high) // 2
-            if fits([fragment(first, middle)]):
+            if fits_here([fragment(first, middle)]):
                 best, low = middle, middle + 1
             else:
                 high = middle - 1
@@ -293,6 +327,12 @@ def _split_hunk(section: dict, fits: Callable[[list[dict]], bool]) -> list[dict]
 
 def build_chunks(packet: ReviewPacket, config: ReviewConfig, *,
                  instructions: str | None = None) -> tuple[ReviewChunk, ...]:
+    """Backward-compatible chunk interface, using the same diagnosed planner."""
+    return plan_chunks(packet, config, instructions=instructions).chunks
+
+
+def plan_chunks(packet: ReviewPacket, config: ReviewConfig, *,
+                instructions: str | None = None) -> ReviewPlan:
     """Byte upper-bound estimate, including schema/messages and output reserve.
 
     Preserve files/hunks where possible, then partition oversized hunks at
@@ -355,27 +395,53 @@ def build_chunks(packet: ReviewPacket, config: ReviewConfig, *,
         return content, estimate + config.output_tokens + config.headroom
 
     _, whole_size = make(sections, 1, 1)
+
+    def diagnostics(groups: list[list[dict]] | None, limit: str | None = None) -> ReviewDiagnostics:
+        sizes = ([make(group, len(groups), i)[1] for i, group in enumerate(groups, 1)]
+                 if groups else [])
+        overhead = ([make([], len(groups), i)[1] for i in range(1, len(groups) + 1)]
+                    if groups else [])
+        return ReviewDiagnostics(
+            len(encoded(essential).encode("utf-8")), make([], 1, 1)[1],
+            sum(len(change.patch.encode("utf-8")) for change in packet.changes),
+            len(groups) if groups else None, sum(sizes) if sizes else None,
+            sum(overhead[1:]) if overhead else None, max(sizes, default=whole_size),
+            config.request_budget, config.max_chunks, config.max_review_tokens, limit,
+        )
+
     groups: list[list[dict]] = []
     expected_sections = sections
     if whole_size <= config.request_budget:
         groups = [sections]
     else:
         if make([])[1] > config.request_budget:
-            raise ReviewError("Essential review evidence exceeds the safe request budget")
+            raise ReviewError("Essential review evidence exceeds the safe request budget",
+                              diagnostics=diagnostics(None, "essential_request_budget"))
         expected_sections = []
         group: list[dict] = []
+
+        def units(file_sections: list[dict]) -> Iterator[list[dict]]:
+            if make(file_sections)[1] <= config.request_budget:
+                yield file_sections
+                return
+            for section in file_sections:
+                if make([section])[1] <= config.request_budget:
+                    yield [section]
+                    continue
+                try:
+                    parts = _split_hunk(
+                        section, lambda items: make(items)[1] <= config.request_budget,
+                        first_fits=lambda items: make([*group, *items])[1] <= config.request_budget,
+                    )
+                except ReviewError as exc:
+                    raise ReviewError(str(exc), diagnostics=diagnostics(None, "request_budget")) from None
+                for part in parts:
+                    yield [part]
+
         # Keep whole files together where possible, then fall back to hunks.
         for file_index in range(len(packet.changes)):
             file_sections = [s for s in sections if s["section_id"].startswith(f"{file_index}:")]
-            if make(file_sections)[1] <= config.request_budget:
-                units = [file_sections]
-            else:
-                units = []
-                for section in file_sections:
-                    parts = ([section] if make([section])[1] <= config.request_budget else
-                             _split_hunk(section, lambda items: make(items)[1] <= config.request_budget))
-                    units.extend([part] for part in parts)
-            for unit in units:
+            for unit in units(file_sections):
                 expected_sections.extend(unit)
                 if group and make([*group, *unit])[1] > config.request_budget:
                     groups.append(group)
@@ -384,17 +450,19 @@ def build_chunks(packet: ReviewPacket, config: ReviewConfig, *,
         if group:
             groups.append(group)
     if not groups or len(groups) > config.max_chunks:
-        raise ReviewError("Excessive review chunks")
+        raise ReviewError("Excessive review chunks", diagnostics=diagnostics(groups, "max_chunks"))
     chunks = []
     for index, group in enumerate(groups, 1):
         content, size = make(group, len(groups), index)
         if size > config.request_budget:
-            raise ReviewError("Final review request exceeds the safe request budget")
+            raise ReviewError("Final review request exceeds the safe request budget",
+                              diagnostics=diagnostics(groups, "request_budget"))
         identity = hashlib.sha256(content.encode("utf-8")).hexdigest()
         chunks.append(ReviewChunk(identity, tuple(s["section_id"] for s in group), content, size))
     coverage = [section for chunk in chunks for section in chunk.coverage]
     if coverage != [section["section_id"] for section in expected_sections] or len(set(coverage)) != len(coverage):
         raise ReviewError("Incomplete or duplicate diff coverage")
     if sum(chunk.estimated_tokens for chunk in chunks) > config.max_review_tokens:
-        raise ReviewError("Total review allowance would be exceeded")
-    return tuple(chunks)
+        raise ReviewError("Total review allowance would be exceeded",
+                          diagnostics=diagnostics(groups, "max_review_tokens"))
+    return ReviewPlan(tuple(chunks), diagnostics(groups))

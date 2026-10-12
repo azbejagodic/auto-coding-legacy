@@ -19,7 +19,7 @@ from ..review_history import utc_now
 from ..review_security import sanitize
 from ..reviews import (
     ARRAY_FIELDS, CONFIDENCES, ReviewConfig, ReviewError, ReviewPacket, ReviewResult,
-    TEMPLATE_VERSION, build_chunks, request_arguments, template, validate_response,
+    TEMPLATE_VERSION, plan_chunks, request_arguments, template, validate_response,
 )
 
 if TYPE_CHECKING:
@@ -209,10 +209,14 @@ class GroqReviewer:
                               if key not in ("prompt", "title", "acceptance_criteria")}
                 if packet.approved_configuration != definition:
                     raise ReviewError("Frozen task configuration differs from review evidence")
-            chunks = build_chunks(packet, self.config, instructions=instructions)
+            planned = plan_chunks(packet, self.config, instructions=instructions)
+            chunks = planned.chunks
+            record["budget_diagnostics"] = asdict(planned.diagnostics)
         except (ReviewError, ValueError) as exc:
             # Only known sanitized validation messages may be retained.
             error = str(exc) if isinstance(exc, ReviewError) else "Unsafe or inconsistent review evidence"
+            if isinstance(exc, ReviewError) and exc.diagnostics is not None:
+                record["budget_diagnostics"] = asdict(exc.diagnostics)
 
         logger.info("Groq review start: model=%s chunks=%d", self.config.model, len(chunks))
         for index, chunk in enumerate(chunks, 1):

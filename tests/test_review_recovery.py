@@ -314,6 +314,36 @@ def test_missing_database_preflight_creates_nothing(tmp_path):
     assert not database.parent.exists()
 
 
+def test_preflight_reports_sizes_and_cli_overrides_without_writes(stopped, monkeypatch, capsys):
+    w = stopped
+    configurations = []
+    def make(store, **kwargs):
+        configurations.append(kwargs["review_config"])
+        return BatchController(
+            store, single=SingleTaskController(store, repository_factory=lambda _: w.repo,
+                                              lock_factory=w.single.lock_factory),
+            reviewer_factory=w.batch.reviewer_factory, **kwargs,
+        )
+    monkeypatch.setattr("auto_coding.batch_controller.BatchController", make)
+    arguments = ["batch", "review-retry", "BATCH", "--db", str(w.database),
+                 "--repo", str(w.repo.path), "--task", "TASK-1"]
+    before = w.database.read_bytes()
+    assert main(arguments) == 0
+    output = capsys.readouterr().out
+    assert "NOT API tokens" in output and "chunks=1/16" in output
+    assert "estimated total=" in output and "limiting factor=none" in output
+    assert configurations[-1].request_budget == 30000
+    assert main([*arguments, "--review-budget", "16000", "--review-token-limit", "80000"]) == 0
+    assert configurations[-1].request_budget == 16000
+    assert configurations[-1].max_review_tokens == 80000
+    assert main([*arguments, "--review-token-limit", "100"]) == 1
+    output = capsys.readouterr().out
+    assert "limiting factor=max_review_tokens" in output and "/100;" in output
+    assert w.database.read_bytes() == before
+    assert w.store.executions.recovery("TASK-1") is None
+    w.client.chat.completions.with_raw_response.create.assert_not_called()
+
+
 @pytest.mark.parametrize("kind", ["remote", "dirty", "task", "binding", "history"])
 def test_drift_during_recovery_cannot_finalize(stopped, kind):
     w = stopped
