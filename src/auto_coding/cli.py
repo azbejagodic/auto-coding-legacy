@@ -8,6 +8,7 @@ import sys
 
 from .diagnostics import run_doctor
 from .logging_config import configure_logging
+from .operations import configure_operations, event
 from .plans import PlanConflictError, PlanValidationError, load_plan
 from .reviews import ReviewConfig
 from .storage import TaskStore
@@ -138,6 +139,8 @@ def main(argv: list[str] | None = None) -> int:
                 elif any(identities):
                     print("Recovery bindings require --retry-api-compatibility or --continue-technical.", file=sys.stderr)
                     return 1
+                if args.execute:
+                    configure_operations()
                 # Inspect an existing database read-only even when execution was
                 # requested. No migration/write precedes the verified preflight.
                 with TaskStore(args.db, read_only=True) as store:
@@ -178,6 +181,7 @@ def main(argv: list[str] | None = None) -> int:
                 if result.error:
                     print(result.error, file=sys.stderr)
                 return 0 if result.success else 1
+            configure_operations()
             with TaskStore(args.db) as store:
                 result = BatchController(store, review_config=config).run(
                     args.batch_id, args.repo, max_tasks=args.max_tasks
@@ -192,7 +196,9 @@ def main(argv: list[str] | None = None) -> int:
         except KeyboardInterrupt:
             print("Interrupted; inspect batch status and workspace before recovery.", file=sys.stderr)
             return 130
-        except (ValueError, OSError, sqlite3.Error):
+        except (ValueError, OSError, sqlite3.Error) as exc:
+            event("cli.failed", stage="cli_preflight", outcome="failed", error_type=type(exc).__name__,
+                  batch_id=getattr(args, "batch_id", None), task_id=getattr(args, "task", None))
             print("Batch operation failed; check database identity, integrity and permissions.", file=sys.stderr)
             return 1
 

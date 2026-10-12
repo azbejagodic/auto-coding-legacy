@@ -12,6 +12,7 @@ from functools import partial
 from typing import TYPE_CHECKING
 
 from .batch_controller import _approval
+from .operations import event, observed, operation_context
 from .integrations.git import GitError, GitRepository
 from .integrations.groq import GroqReviewer, rate_blocked
 from .integrations.groq_limits import provider_plan, request_tokens
@@ -442,6 +443,7 @@ class ReviewRecovery:
                     raise ValueError("A provider error or substantive judgment cannot be continued")
         return plan, task, persisted_execution, failed or original, packet, binding, context or (previous if compatibility else None)
 
+    @observed("recovery", batch_id="batch_id", task_id="task_id")
     def run(self, batch_id: str, directory: str | Path, *, task_id: str,
             execute: bool = False, compatibility: CompatibilityRetry | None = None,
             continuation: TechnicalContinuation | None = None) -> RecoveryResult:
@@ -473,6 +475,8 @@ class ReviewRecovery:
                                            headroom=self.config.headroom)):
                         raise ValueError(LOCAL_RATE_BLOCK)
                     if not execute:
+                        event("recovery.preflight", stage="recovery_preflight", outcome="eligible",
+                              commit_sha=sha, original_review_id=original_id)
                         return RecoveryResult(batch_id, task_id, True, False, sha, original_id,
                                               diagnostics=sizing)
                     if (self.controller.reviewer_factory is GroqReviewer
@@ -482,7 +486,9 @@ class ReviewRecovery:
                         plan, task, execution, original, asdict(self.config), binding,
                         previous_recovery=previous if continuation is None else None,
                         continuation=previous if continuation is not None else None)
-                    with self.controller.reviewer_factory(self.store, config=self.config) as reviewer:
+                    event("recovery.claimed", stage="recovery_claim", outcome="completed",
+                          recovery_id=claimed["recovery_id"], original_review_id=original_id, commit_sha=sha)
+                    with operation_context(recovery_id=claimed["recovery_id"], original_review_id=original_id), self.controller.reviewer_factory(self.store, config=self.config) as reviewer:
                         result = reviewer.review(packet, recovery_id=claimed["recovery_id"])
                     if not isinstance(result, ReviewResult):
                         raise ValueError("Recovery reviewer returned an invalid result")
@@ -505,6 +511,8 @@ class ReviewRecovery:
                     if current[0] != plan or current[4] != packet:
                         raise ValueError("Frozen plan or review evidence changed during recovery")
                     self.store.finish_review_recovery(task_id, claimed["recovery_id"], review_id, persisted)
+                    event("recovery.finalized", stage="recovery_finalization", outcome=result.decision,
+                          recovery_id=claimed["recovery_id"], review_id=review_id, commit_sha=sha)
                     return RecoveryResult(
                         batch_id, task_id, result.eligible_to_proceed, True, sha, original_id,
                         claimed["recovery_id"], review_id, result.decision,

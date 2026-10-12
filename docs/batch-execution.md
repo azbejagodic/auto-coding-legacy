@@ -5,6 +5,10 @@ status are offline. **Running consumes Codex/Groq usage and commits/pushes to
 the approved development branch.** Nothing automatically merges, repairs,
 retries, generates prompts, or creates PRs.
 
+Authorized execution shows concise progress and records rotating local JSONL
+[operational diagnostics](operational-logging.md). Logging never changes decisions,
+recovery authorization, SQLite history or Git behavior.
+
 ## Prepare and approve
 
 Use the installed Python 3.12 environment. Configure the disposable development

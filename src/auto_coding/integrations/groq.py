@@ -18,6 +18,7 @@ import groq
 
 from ..review_history import utc_now
 from ..review_security import sanitize
+from ..operations import correlate, event, observed
 from .groq_limits import provider_plan, request_tokens
 from ..reviews import (
     ARRAY_FIELDS, CONFIDENCES, ReviewConfig, ReviewError, ReviewPacket, ReviewResult,
@@ -246,7 +247,11 @@ class GroqReviewer:
             )
         return self.review(packet)
 
+    @observed("groq.review", task_id="packet.task_id", commit_sha="packet.commit_sha",
+              fingerprint="packet.plan_fingerprint", recovery_id="recovery_id",
+              model="self.config.model", reasoning_effort="self.config.reasoning_effort")
     def review(self, packet: ReviewPacket, *, recovery_id: str | None = None) -> ReviewResult:
+        review_started = time.monotonic()
         packet = deepcopy(packet)
         task = self.store.get_task(packet.task_id)
         commit = self.store.get_commit(packet.task_id)
@@ -278,6 +283,7 @@ class GroqReviewer:
                 record.update(technical_continuation=True,
                               prior_recovery_ids=[r["recovery_id"] for r in recovery["prior_recoveries"]])
         review_id = self.store.reviews.create(packet.task_id, packet.commit_sha, record)
+        correlate(review_id=review_id, original_review_id=record.get("original_review_id"))
         if recovery_id is not None:
             self.store.attach_recovery_review(packet.task_id, recovery_id, review_id)
         findings: dict[str, list[str]] = {key: [] for key in ARRAY_FIELDS}
@@ -308,16 +314,28 @@ class GroqReviewer:
                 record["budget_diagnostics"] = asdict(exc.diagnostics)
 
         logger.info("Groq review start: model=%s chunks=%d", self.config.model, len(chunks))
+        event("groq.review.planned", stage="review_planning", outcome="blocked" if error else "completed",
+              review_id=review_id, chunk_count=len(chunks), reason=error,
+              estimated_total_tokens=record.get("budget_diagnostics", {}).get("estimated_total_tokens"))
         for index, chunk in enumerate(chunks, 1):
             if error:
                 break
             arguments = request_arguments(self.config, instructions, chunk.content)
             required_tokens = request_tokens(arguments, headroom=self.config.headroom)
+            chunk_fields = {"review_id": review_id, "chunk_id": chunk.chunk_id,
+                            "chunk_index": index, "chunk_count": len(chunks),
+                            "estimated_input_tokens": required_tokens - self.config.output_tokens,
+                            "estimated_output_tokens": self.config.output_tokens,
+                            "estimated_total_tokens": required_tokens, "wire_units": chunk.estimated_tokens}
             limits = self.store.reviews.latest_limits(self.config.model)
+            capacity_started = time.monotonic()
             capacity = (not rate_blocked(limits, required_tokens) if index == 1
                         else wait_for_capacity(limits, required_tokens))
             if not capacity:
                 error = "Provider rate limit/reset prevents another request"
+                event("groq.request.blocked", stage="groq_request", outcome="blocked", **chunk_fields,
+                      duration_seconds=time.monotonic() - capacity_started,
+                      reason=error, rate_limits=limits, rate_limits_observed_at=limits.get("observed_at"))
                 break
             request = {
                 "model": self.config.model, "chunk_id": chunk.chunk_id,
@@ -337,12 +355,18 @@ class GroqReviewer:
                     )
                 except groq.GroqError:
                     error = "Groq authentication configuration unavailable"
+                    event("groq.request.blocked", stage="groq_request", outcome="blocked", **chunk_fields, reason=error)
                     break
             self.store.reviews.start_request(review_id, index, request)
             requests.append(request)
+            request_started = time.monotonic()
+            event("groq.request.submitted", stage="groq_request", outcome="submitted", **chunk_fields)
+            http_status = None
             try:
                 client = self._client.with_options(timeout=self.config.timeout, max_retries=0)
                 raw = client.chat.completions.with_raw_response.create(**arguments)
+                status = getattr(raw, "status_code", None)
+                http_status = status if type(status) is int and 100 <= status <= 599 else None
                 request["rate_limits_observed_at"] = utc_now()
                 request["rate_limits"] = rate_headers(raw.headers)
                 response_text = raw.text() if callable(raw.text) else raw.text
@@ -382,6 +406,15 @@ class GroqReviewer:
             request["completed"] = True
             request["completed_at"] = utc_now()
             self.store.reviews.finish_request(review_id, index, request)
+            event("groq.request.failed" if request["error"] else "groq.request.completed",
+                  stage="groq_request", outcome="failed" if request["error"] else "completed",
+                  duration_seconds=time.monotonic() - request_started, **chunk_fields,
+                  decision=request["decision"], reason=request["error"],
+                  http_status=request.get("http_status", http_status),
+                  provider_error_code=request.get("provider_error_code"),
+                  provider_error_type=request.get("provider_error_type"),
+                  rate_limits=request["rate_limits"], rate_limits_observed_at=request.get("rate_limits_observed_at"),
+                  **(request["usage"] or {}))
             # Rejection is final, never retry or seek an approving replacement.
             if responses and responses[-1]["decision"] == "REJECTED":
                 break
@@ -427,6 +460,17 @@ class GroqReviewer:
             "unknown_usage_requests": sum(request["usage"] is None for request in requests),
         })
         self.store.reviews.finish(review_id, record)
+        reason = error
+        if decision == "UNCERTAIN" and reason is None:
+            reason = ("Incomplete review coverage" if not complete else "Provider returned UNCERTAIN"
+                      if any(response["decision"] != "APPROVED" for response in responses)
+                      else "Approved acceptance criteria were not all checked")
+        event("groq.review.decision", stage="review_decision", outcome=decision,
+              duration_seconds=time.monotonic() - review_started, review_id=review_id,
+              reason=reason, coverage_complete=complete, chunk_count=len(chunks), **totals,
+              unknown_usage_requests=record["unknown_usage_requests"],
+              blocking_issue_count=len(result.blocking_issues),
+              unchecked_requirement_count=sum(criterion not in checked for criterion in packet.acceptance_criteria))
         logger.info("Groq review complete: decision=%s requests=%d error=%s",
                     decision, len(requests), error)
         return result

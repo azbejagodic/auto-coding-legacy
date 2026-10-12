@@ -11,9 +11,12 @@ from pathlib import Path
 import re
 import shutil
 import subprocess
+import time
 from typing import Sequence
 from urllib.parse import urlsplit
 from uuid import uuid4
+
+from ..operations import event, observed
 
 
 logger = logging.getLogger(__name__)
@@ -118,6 +121,7 @@ class GitRepository:
         # check-ignore takes literal file names already and rejects pathspec
         # magic, including the global literal-pathspecs option.
         literal = [] if args[0] == "check-ignore" else ["--literal-pathspecs"]
+        started = time.monotonic()
         try:
             completed = subprocess.run(
                 [self.executable, *literal, "-c", f"core.hooksPath={os.devnull}", *args],
@@ -128,9 +132,13 @@ class GitRepository:
             )
         except subprocess.TimeoutExpired:
             logger.warning("Git %s timed out", args[0])
+            event("git.command.failed", stage="git." + args[0], outcome="timed_out", timed_out=True,
+                  duration_seconds=time.monotonic() - started, reason="Git command timed out")
             raise GitError(args[0], "Git command timed out; inspect repository/remote state before retrying") from None
         except OSError as exc:
             logger.warning("Git %s failed to launch", args[0])
+            event("git.command.failed", stage="git." + args[0], outcome="failed", error_type=type(exc).__name__,
+                  duration_seconds=time.monotonic() - started, reason="Git launch failed")
             raise GitError(args[0], f"Git could not launch (errno={exc.errno})") from None
         if preserve_newlines:
             try:
@@ -148,6 +156,8 @@ class GitRepository:
             elif any(word in output for word in ("resolve host", "unable to access", "connection", "network")):
                 category = "Network or remote access failure"
             logger.warning("Git %s failed: exit_code=%s", args[0], completed.returncode)
+            event("git.command.failed", stage="git." + args[0], outcome="failed", exit_code=completed.returncode,
+                  duration_seconds=time.monotonic() - started, reason=category)
             raise GitError(args[0], f"{category} (exit code {completed.returncode})", completed.returncode)
         return completed
 
@@ -383,6 +393,7 @@ class GitRepository:
             raise GitError("execute", "Unexpected changed files outside the approved file list")
         return selected
 
+    @observed("git.commit")
     def commit_files(self, expected_branch: str, files: Sequence[str | Path], message: str,
                      *, expected_base_sha: str | None = None) -> GitResult:
         self._expect_branch(expected_branch)
@@ -428,6 +439,7 @@ class GitRepository:
         digest.update("\0".join(sorted(files)).encode("utf-8"))
         return digest.hexdigest()
 
+    @observed("git.remote_verify", commit_sha="expected_sha")
     def verify_remote_commit(self, expected_branch: str, expected_sha: str, expected_origin: str) -> None:
         """Read-only reconciliation: never push again to find out what happened."""
         self._expect_branch(expected_branch)
@@ -455,6 +467,7 @@ class GitRepository:
         if self.current_commit_sha() != parent:
             raise GitError("reconcile", "HEAD differs from the last finalized task")
 
+    @observed("git.push", commit_sha="expected_commit_sha")
     def push_branch(self, expected_branch: str, expected_commit_sha: str) -> GitResult:
         self._expect_branch(expected_branch)
         self._check_operation_state()

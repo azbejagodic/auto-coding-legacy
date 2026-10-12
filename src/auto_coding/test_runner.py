@@ -14,6 +14,7 @@ import time
 from typing import Sequence
 
 from .integrations.windows_process import ProcessSafetyError, run_contained
+from .operations import observed, operation_context
 
 
 logger = logging.getLogger(__name__)
@@ -72,6 +73,7 @@ def _cleanup(process: subprocess.Popen[str]) -> str | None:
     return "; ".join(errors) or None
 
 
+@observed("tests.command")
 def _execute(arguments: tuple[str, ...], directory: Path, timeout: float) -> CommandResult:
     started = time.monotonic()
     logger.info("Test command start: executable=%r argument_count=%d",
@@ -173,6 +175,7 @@ def validate_test_plan(
     return directory, tuple(approved)
 
 
+@observed("tests")
 def run_tests(
     working_directory: str | Path,
     commands: Sequence[Sequence[str]],
@@ -203,8 +206,9 @@ def run_tests(
     except ValueError as exc:
         return finish([], str(exc))
     results = []
-    for command in approved:
-        result = _execute(command, directory, timeout)
+    for index, command in enumerate(approved, 1):
+        with operation_context(command_index=index, command_count=len(approved)):
+            result = _execute(command, directory, timeout)
         results.append(result)
         if not result.success:
             break

@@ -52,6 +52,13 @@ in [known issues](docs/known-issues.md#existing-lock-termination-test-with-windo
 No application lock checks or test assertions are disabled.
 
 Application logs are written to `logs\auto-coding.log` when the application configures logging.
+Authorized batch runs/recovery also write rotating structured diagnostics to
+`runtime\logs\operations.jsonl` and show concise terminal progress. Read-only
+commands create no operational logs. See [operational diagnostics](docs/operational-logging.md).
+
+```powershell
+Get-Content .\runtime\logs\operations.jsonl -Tail 30
+```
 
 ## Groq quick reviews
 

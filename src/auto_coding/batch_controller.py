@@ -13,6 +13,7 @@ import shutil
 from typing import Callable, TYPE_CHECKING
 
 from .controller import SingleTaskController
+from .operations import correlate, event, observed
 from .integrations.codex import run_codex
 from .integrations.git import GitError
 from .integrations.groq import GroqReviewer
@@ -92,6 +93,7 @@ class BatchController:
         return ReviewRecovery(self).run(batch_id, working_directory, task_id=task_id,
                                        execute=execute, compatibility=compatibility, continuation=continuation)
 
+    @observed("batch", batch_id="batch_id")
     def run(self, batch_id: str, working_directory: str | Path, *, max_tasks: int | None = None) -> BatchResult:
         current = last = sha = decision = None
         count = 0
@@ -100,6 +102,8 @@ class BatchController:
         progress_uncertain = False
 
         def stopped(error: str) -> BatchResult:
+            event("batch.stopped", task_id=current, stage=stage, outcome="failed",
+                  commit_sha=sha, decision=decision)
             return BatchResult(batch_id, False, False, count, current, last, sha, decision, stage, error)
 
         def checkpoint(name: str, details: dict) -> None:
@@ -108,6 +112,9 @@ class BatchController:
             if name != "stopped":
                 stage = name
             logger.info("Batch checkpoint: batch=%s task=%s stage=%s", batch_id, current, name)
+            event("batch.checkpoint", task_id=current, stage=name,
+                  outcome="failed" if name == "stopped" else "started" if name.endswith("started") else "completed",
+                  commit_sha=sha, review_id=details.get("review_id"), decision=details.get("review_status"))
 
         def persist_stop(error: str) -> None:
             if owned:
@@ -224,6 +231,7 @@ class BatchController:
                 with self.reviewer_factory(self.store, config=self.review_config) as reviewer:
                     for task in pending:
                         current, owned, decision, sha = task["task_id"], False, None, None
+                        correlate(task_id=current, fingerprint=plan.fingerprint)
                         stage = "preflight"
                         if self.store.get_plan(batch_id) != plan:
                             raise ValueError("Frozen plan changed")
@@ -276,6 +284,8 @@ class BatchController:
                             error = "Groq review did not provide complete approval; inspect private review history"
                             if decision == "REJECTED":
                                 self.store.finalize_plan_task(current, review.review_id, approved=False)
+                                event("task.finalized", task_id=current, stage="finalized", outcome="REJECTED",
+                                      review_id=review.review_id, commit_sha=sha)
                                 owned = False
                             else:
                                 persist_stop(error)
@@ -286,6 +296,8 @@ class BatchController:
                             raise ValueError("Frozen plan changed during review")
                         self.store.validate_plan_tasks(plan)
                         self.store.finalize_plan_task(current, review.review_id, approved=True)
+                        event("task.finalized", task_id=current, stage="finalized", outcome="APPROVED",
+                              review_id=review.review_id, commit_sha=sha)
                         owned = False
                         last = current
                         approved_shas.append(sha)

@@ -11,6 +11,7 @@ from typing import Callable, Sequence
 from .integrations.codex import CodexResult, run_codex
 from .integrations.git import GitError, GitRepository, RepositoryState
 from .plans import FrozenPlan
+from .operations import event, observed
 from .storage import PushState, TaskStatus, TaskStore
 from .test_runner import TestRunResult, run_tests, validate_test_plan
 from .workspace_lock import WorkspaceBusyError, WorkspaceLock, WorkspaceLockError
@@ -59,6 +60,7 @@ class SingleTaskController:
         self.lock_factory = lock_factory
         self.repository_factory = repository_factory
 
+    @observed("task.preflight", task_id="task_id")
     def execute(
         self,
         task_id: str,
@@ -99,6 +101,7 @@ class SingleTaskController:
                                    time.monotonic() - started, workspace_busy=busy, branch=expected_branch)
         return replace(result, duration_seconds=time.monotonic() - started)
 
+    @observed("task", task_id="task_id", batch_id="plan.batch_id", fingerprint="plan.fingerprint")
     def _execute_locked(
         self,
         task_id: str,
@@ -130,6 +133,12 @@ class SingleTaskController:
         def progress(stage: str, **details) -> None:
             if checkpoint is not None:
                 checkpoint(stage, details)
+            metrics = details.get("codex") or details.get("tests") or {}
+            event("task.checkpoint", stage=stage,
+                  outcome="started" if stage.endswith("started") else "failed" if metrics.get("success") is False else "completed",
+                  duration_seconds=metrics.get("duration_seconds", time.monotonic() - started),
+                  model=model, commit_sha=commit_sha, local_sha=details.get("local_sha"), remote_sha=details.get("remote_sha"),
+                  **{key: metrics[key] for key in ("success", "exit_code", "timed_out") if key in metrics})
 
         def finish(error: str | None = None, *, uncertain: bool = False) -> ExecutionResult:
             duration = time.monotonic() - started
@@ -199,6 +208,7 @@ class SingleTaskController:
                               uncertain=True)
             return finish("Task is no longer queued or another execution already claimed it")
         status = TaskStatus.RUNNING
+        event("task.claimed", stage="claimed", outcome="completed", model=model)
         try:
             # Share runner validation; do not spend model usage on invalid tests.
             directory, approved = validate_test_plan(working_directory, test_commands, test_timeout)

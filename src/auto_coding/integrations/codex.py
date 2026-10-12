@@ -14,6 +14,7 @@ import time
 from typing import Any
 
 from .windows_process import ProcessSafetyError
+from ..operations import observed
 
 
 logger = logging.getLogger(__name__)
@@ -103,6 +104,7 @@ def _parse_events(stdout: str) -> tuple[list[dict[str, Any]], str | None, str | 
     return events, final_response, error
 
 
+@observed("codex", model="model", reasoning_effort="reasoning_effort")
 def run_codex(
     prompt: str,
     model: str,
