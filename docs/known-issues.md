@@ -49,11 +49,24 @@ This is not provider token usage, recovery authorization, a remote-state check
 or an approval. Larger commits, provider limits and model uncertainty can still
 block review; the total cap, coverage requirements and fail-closed behavior
 remain unchanged. See [budget measurements](groq-reviews.md#practical-budgeting-task-011-groq-unblock).
-Recovery allows only one durably claimed attempt per stopped task. Interrupted
-or nonapproving attempts require manual reconciliation; there is no retry of a
-recovery or atomic transaction spanning provider delivery and SQLite.
+Ordinary recovery allows only one durably claimed attempt per stopped task.
+TASK-011-GROQ-API-FIX adds one explicitly identity-bound second technical attempt
+only for the historical completed unsupported-`store` HTTP failure. There is no
+third attempt or retry of a substantive judgment. Interrupted/nonapproving
+attempts require manual reconciliation; no atomic transaction spans provider
+delivery and SQLite.
 Preflight performs read-only remote queries and uses the existing external OS
 coordination lock file, but creates no application records or model requests.
+
+The legacy first recovery did not retain HTTP status, so its `provider_http_error`
+alone cannot prove the provider's reason. The exception requires the exact
+completed unsupported request, unchanged evidence/history, and operator-supplied
+review ID/fingerprint/SHA/branch; known non-400/422 statuses are refused. Future
+HTTP failures retain safe status/type/code/rate-limit diagnostics. Removing
+`store` corrects request compatibility, but does not guarantee provider capacity,
+model availability, token allowance or approval. No live request or recovery was
+run for this fix, and the real SQLite database/target repository remain untouched.
+See the [second-recovery procedure](batch-execution.md#one-second-technical-recovery-for-the-unsupported-groq-parameter).
 
 ## Existing lock-termination test with Windows venv redirectors
 

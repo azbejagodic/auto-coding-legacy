@@ -249,7 +249,7 @@ def request_arguments(config: ReviewConfig, instructions: str, content: str) -> 
             "name": "quick_review", "strict": True, "schema": RESPONSE_SCHEMA,
         }},
         "max_completion_tokens": config.output_tokens, "stream": False,
-        "include_reasoning": False, "store": False,
+        "include_reasoning": False,
     }
 
 

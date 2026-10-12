@@ -39,4 +39,9 @@ def test_opted_in_script_mocked_only(smoke, monkeypatch):
     factory.return_value.__exit__ = Mock(return_value=False)
     monkeypatch.setattr(smoke.groq, "Groq", factory)
     assert smoke.main(["--allow-live"]) == 0
+    arguments = client.chat.completions.create.call_args.kwargs
+    assert "store" not in arguments
+    assert arguments["model"] == "openai/gpt-oss-120b"
+    assert arguments["reasoning_effort"] == "medium"
+    assert arguments["response_format"]["type"] == "json_schema"
     assert client.chat.completions.create.call_count == 1

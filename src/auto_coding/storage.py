@@ -428,17 +428,21 @@ class TaskStore:
         })
 
     def claim_review_recovery(self, plan: FrozenPlan, task: Task, execution: dict,
-                              original_review: dict, config: dict, binding: dict) -> dict:
+                              original_review: dict, config: dict, binding: dict, *,
+                              previous_recovery: dict | None = None) -> dict:
         """Durable one-attempt intent. Interrupted attempts are never replayed."""
         from dataclasses import asdict
         with self._connection:
             self._connection.execute("BEGIN IMMEDIATE")
+            previous_reviews = ([previous_recovery["original_review"], original_review]
+                                if previous_recovery is not None else [original_review])
             if (self.get_plan(plan.batch_id) != plan or self.get_task(task.task_id) != task
                     or task.status != TaskStatus.AWAITING_REVIEW
                     or self.executions.get(task.task_id) != execution
                     or self.executions.binding(plan.batch_id) != binding
-                    or self.reviews.list(task.task_id) != [original_review]
-                    or self.executions.recovery(task.task_id) is not None):
+                    or self.reviews.list(task.task_id) != previous_reviews
+                    or self.executions.recovery(task.task_id) != previous_recovery
+                    or self.executions.recovery(task.task_id, compatibility=True) is not None):
                 raise ValueError("Recovery state changed or was already claimed")
             self.validate_plan_tasks(plan)
             commit = self.get_commit(task.task_id)
@@ -454,8 +458,17 @@ class TaskStore:
                 "original_task": asdict(task), "original_commit": asdict(commit), "config": config,
                 "original_binding": binding,
             }
+            table = "review_recoveries"
+            if previous_recovery is not None:
+                if (previous_recovery.get("stage") != "finished"
+                        or previous_recovery.get("decision") != "UNCERTAIN"
+                        or previous_recovery.get("review_id") != original_review["review_id"]):
+                    raise ValueError("Previous recovery is not a completed technical failure")
+                table = "review_compatibility_recoveries"
+                record.update(compatibility_retry=True, previous_recovery=previous_recovery,
+                              previous_reviews=previous_reviews)
             self._connection.execute(
-                "INSERT INTO review_recoveries VALUES (?, ?, ?)",
+                f"INSERT INTO {table} VALUES (?, ?, ?)",
                 (task.task_id, record["recovery_id"], json.dumps(record, ensure_ascii=False, allow_nan=False)),
             )
         return record
@@ -463,7 +476,7 @@ class TaskStore:
     def attach_recovery_review(self, task_id: str, recovery_id: str, review_id: str) -> None:
         with self._connection:
             self._connection.execute("BEGIN IMMEDIATE")
-            record = self.executions.recovery(task_id)
+            record = self.executions.recovery_by_id(task_id, recovery_id)
             review = self.reviews.get(review_id)
             if (not record or record["recovery_id"] != recovery_id or record["stage"] != "claimed"
                     or not review or review["task_id"] != task_id
@@ -480,7 +493,7 @@ class TaskStore:
         from .batch_controller import _approval
         with self._connection:
             self._connection.execute("BEGIN IMMEDIATE")
-            record = self.executions.recovery(task_id)
+            record = self.executions.recovery_by_id(task_id, recovery_id)
             if (not record or record["recovery_id"] != recovery_id
                     or record["stage"] != "reviewing" or record["review_id"] != review_id):
                 raise ValueError("Recovery is missing, interrupted or already completed")
@@ -498,9 +511,13 @@ class TaskStore:
                     or review["task_id"] != task_id or review["commit_sha"] != commit.commit_sha):
                 raise ValueError("Recovery evidence changed before finalization")
             histories = self.reviews.list(task_id)
-            if len(histories) != 2 or {item["review_id"] for item in histories} != {
-                record["original_review_id"], review_id
-            }:
+            previous = record.get("previous_reviews", [record["original_review"]])
+            if (len(histories) != len(previous) + 1
+                    or {item["review_id"] for item in histories} != {
+                        *(item["review_id"] for item in previous), review_id}
+                    or any(self.reviews.get(item["review_id"]) != item for item in previous)
+                    or (record.get("compatibility_retry") and
+                        self.executions.recovery(task_id) != record["previous_recovery"])):
                 raise ValueError("Conflicting review history appeared before finalization")
             self.validate_plan_tasks(plan)
             decision = review["decision"]
@@ -527,7 +544,7 @@ class TaskStore:
     def block_review_recovery(self, task_id: str, recovery_id: str) -> None:
         with self._connection:
             self._connection.execute("BEGIN IMMEDIATE")
-            record = self.executions.recovery(task_id)
+            record = self.executions.recovery_by_id(task_id, recovery_id)
             if record and record["recovery_id"] == recovery_id and record["stage"] != "finished":
                 record.update(stage="blocked", error="Recovery interrupted or safety/persistence verification failed",
                               finished_at=_timestamp())

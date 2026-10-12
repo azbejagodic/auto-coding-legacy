@@ -255,13 +255,58 @@ python -m auto_coding batch run BATCH_ID --db path/to/tasks.sqlite3 --repo path/
 ```
 
 It verifies and skips the recovered finalized prefix. Recovery itself never calls
-this loop. Any claimed/interrupted/nonapproving recovery blocks another attempt,
+this loop. Any claimed/interrupted/nonapproving recovery blocks another ordinary attempt,
 including after restart. Inspect the audit event, both reviews, Git and processes;
 do not delete rows, reset statuses or seek another approval. No automatic recovery
-of a recovery is implemented. Network and SQLite are not one transaction; crashes
+of a recovery is implemented. The sole explicit legacy API exception is below.
+Network and SQLite are not one transaction; crashes
 after provider delivery can leave unknown usage requiring manual reconciliation.
 TASK-011-RECOVERY did not inspect the real batch/database. TASK-011-GROQ-UNBLOCK
 subsequently measured its packet read-only: it fits the new default size plan,
 but actual recovery eligibility, remote state and provider approval remain
 unverified. Neither task made live model requests or changes to
 `auto-coding-test`.
+
+### One second technical recovery for the unsupported Groq parameter
+
+TASK-011-GROQ-API-FIX removes the unsupported Chat Completions `store` field.
+It does not execute recovery. A separately authorized second attempt is allowed
+only after the first recovery finished UNCERTAIN with exactly one completed
+`provider_http_error` request, containing the exact historical `store: false`
+arguments and complete frozen evidence, with no response, findings or known
+usage. The initial zero-request preparation failure and successful original
+Codex/test/push provenance must still validate. Known HTTP statuses other than
+400/422 are refused. Legacy missing status is accepted only with these strict
+historical checks and explicit operator bindings; it is **not proof** of HTTP
+400 or of the provider's reason for rejecting the request.
+
+Bind the failed first-recovery review ID, plan fingerprint, full commit SHA and
+approved development branch. Example read-only preflight for the existing case:
+
+```powershell
+python -m auto_coding batch review-retry VISUAL-BOARD-BATCH-002 --db runtime/tasks.sqlite3 --repo 'C:\Users\Ažbe\Desktop\auto-coding-test' --task VISUAL2-001 --retry-api-compatibility --failed-review-id 7a6f54e8df6b46a0b502cf1a9967b19c --expected-fingerprint 002ca0284a67606eaaa18ddb71f341eda8834b203e0d611719caaeb7d2056436 --expected-sha 80c9098dc8cd084e97f1769d53b3cf06354c4e7f --expected-branch feature/visual-board-test
+```
+
+Use the actual configurable local paths on another computer. Without `--execute`,
+this only opens the existing database read-only and verifies the locked clean
+repository, branch, source/parent chain, origin and remote SHA. No API key, model
+request, database migration or application-state write is needed. Existing lock
+coordination-file behavior is unchanged. Do not treat successful preflight as
+authorization or approval. Only a separate explicitly authorized invocation of
+the same bound command with `--execute` may consume the one remaining attempt.
+
+The additive `review_compatibility_recoveries` table holds a unique second claim
+per task, with snapshots of both reviews, the original recovery audit and current
+stopped execution. Inspect it privately with
+`store.executions.recovery(task_id, compatibility=True)`. The original
+`review_recoveries` row and both prior reviews remain unchanged. The new review
+records `recovery_attempt=2`, `previous_recovery_id`, `original_review_id` (the
+failed HTTP review), and its own recovery ID/timestamp. No third claim is allowed,
+including after crash, interruption, API failure, rejection or uncertainty.
+Historical data is never deleted to enable another approval attempt.
+
+All normal coverage/criteria checks and post-review identity verification still
+apply before atomic finalization. This path never calls Codex, reruns tests,
+stages, commits, pushes or starts another task. Development used only temporary
+databases/repositories and mocked HTTP; the actual private database and target
+repository were not changed and no live recovery or API request was made.

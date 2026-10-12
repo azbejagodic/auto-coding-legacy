@@ -48,6 +48,12 @@ def build_parser() -> argparse.ArgumentParser:
     retry.add_argument("--review-budget", type=int, default=ReviewConfig.request_budget)
     retry.add_argument("--review-token-limit", type=int, default=ReviewConfig.max_review_tokens)
     retry.add_argument("--execute", action="store_true", help="authorize one review only; never coding or push")
+    retry.add_argument("--retry-api-compatibility", action="store_true",
+                       help="explicitly select the single second recovery for the legacy unsupported-store error")
+    retry.add_argument("--failed-review-id")
+    retry.add_argument("--expected-fingerprint")
+    retry.add_argument("--expected-sha")
+    retry.add_argument("--expected-branch")
     return parser
 
 
@@ -111,11 +117,25 @@ def main(argv: list[str] | None = None) -> int:
             from .batch_controller import BatchController
             config = ReviewConfig(request_budget=args.review_budget, max_review_tokens=args.review_token_limit)
             if args.batch_command == "review-retry":
+                from .review_recovery import CompatibilityRetry
+                compatibility = None
+                identities = (args.failed_review_id, args.expected_fingerprint,
+                              args.expected_sha, args.expected_branch)
+                if args.retry_api_compatibility:
+                    if not all(identities):
+                        print("Second recovery requires --failed-review-id, --expected-fingerprint, "
+                              "--expected-sha and --expected-branch; nothing was changed.", file=sys.stderr)
+                        return 1
+                    compatibility = CompatibilityRetry(*identities)
+                elif any(identities):
+                    print("Second recovery bindings require --retry-api-compatibility.", file=sys.stderr)
+                    return 1
                 # Inspect an existing database read-only even when execution was
                 # requested. No migration/write precedes the verified preflight.
                 with TaskStore(args.db, read_only=True) as store:
                     preflight = BatchController(store, review_config=config).review_retry(
                         args.batch_id, args.repo, task_id=args.task,
+                        compatibility=compatibility,
                     )
                 if not args.execute or not preflight.success:
                     result = preflight
@@ -123,6 +143,7 @@ def main(argv: list[str] | None = None) -> int:
                     with TaskStore(args.db) as store:
                         result = BatchController(store, review_config=config).review_retry(
                             args.batch_id, args.repo, task_id=args.task, execute=True,
+                            compatibility=compatibility,
                         )
                 print(f"Review recovery {'attempt' if result.executed else 'preflight'}: "
                       f"batch={result.batch_id}; task={result.task_id}; "

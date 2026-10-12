@@ -29,7 +29,7 @@ def main(argv: list[str] | None = None) -> int:
                         "type": "object", "additionalProperties": False,
                         "properties": {"ok": {"type": "boolean"}}, "required": ["ok"],
                     },
-                }}, max_completion_tokens=512, include_reasoning=False, store=False,
+                }}, max_completion_tokens=512, include_reasoning=False,
             )
         if (completion.model != "openai/gpt-oss-120b" or len(completion.choices) != 1
                 or completion.choices[0].finish_reason != "stop"

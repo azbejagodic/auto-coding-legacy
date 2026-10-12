@@ -31,6 +31,13 @@ def initialize_batch_schema(connection: sqlite3.Connection) -> None:
             record_json TEXT NOT NULL
         )
     """)
+    connection.execute("""
+        CREATE TABLE IF NOT EXISTS review_compatibility_recoveries (
+            task_id TEXT PRIMARY KEY REFERENCES review_recoveries(task_id),
+            recovery_id TEXT UNIQUE NOT NULL,
+            record_json TEXT NOT NULL
+        )
+    """)
 
 
 class BatchHistory:
@@ -64,13 +71,14 @@ class BatchHistory:
             self._connection.execute("BEGIN IMMEDIATE")
             self._checkpoint(task_id, stage, details or {})
 
-    def recovery(self, task_id: str) -> dict | None:
+    def recovery(self, task_id: str, *, compatibility: bool = False) -> dict | None:
+        table = "review_compatibility_recoveries" if compatibility else "review_recoveries"
         if not self._connection.execute(
-            "SELECT 1 FROM sqlite_master WHERE name = 'review_recoveries'"
+            "SELECT 1 FROM sqlite_master WHERE name = ?", (table,)
         ).fetchone():
             return None
         row = self._connection.execute(
-            "SELECT task_id, recovery_id, record_json FROM review_recoveries WHERE task_id = ?", (task_id,)
+            f"SELECT task_id, recovery_id, record_json FROM {table} WHERE task_id = ?", (task_id,)
         ).fetchone()
         if row is None:
             return None
@@ -79,10 +87,24 @@ class BatchHistory:
             raise ValueError("Recovery audit identity is inconsistent")
         return record
 
+    def recovery_by_id(self, task_id: str, recovery_id: str) -> dict | None:
+        matches = [record for second in (False, True)
+                   if (record := self.recovery(task_id, compatibility=second)) is not None
+                   and record["recovery_id"] == recovery_id]
+        if len(matches) > 1:
+            raise ValueError("Conflicting recovery audit identities")
+        return matches[0] if matches else None
+
     def _save_recovery(self, record: dict) -> None:
+        matches = [second for second in (False, True)
+                   if (saved := self.recovery(record["task_id"], compatibility=second)) is not None
+                   and saved["recovery_id"] == record["recovery_id"]]
+        if len(matches) != 1:
+            raise ValueError("Recovery audit record disappeared or is ambiguous")
+        table = "review_compatibility_recoveries" if matches[0] else "review_recoveries"
         safe, _ = sanitize(record)
         cursor = self._connection.execute(
-            "UPDATE review_recoveries SET record_json = ? WHERE task_id = ? AND recovery_id = ?",
+            f"UPDATE {table} SET record_json = ? WHERE task_id = ? AND recovery_id = ?",
             (json.dumps(safe, ensure_ascii=False, allow_nan=False),
              record["task_id"], record["recovery_id"]),
         )

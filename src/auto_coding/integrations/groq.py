@@ -32,6 +32,25 @@ _LIMIT_HEADERS = {
     "x-ratelimit-remaining-requests", "x-ratelimit-remaining-tokens",
     "x-ratelimit-reset-requests", "x-ratelimit-reset-tokens",
 }
+_ERROR_LABELS = frozenset({
+    "invalid_request_error", "invalid_request", "invalid_api_key", "authentication_error",
+    "permission_error", "permission_denied", "rate_limit_exceeded", "rate_limit_error",
+    "insufficient_quota", "quota_exceeded", "server_error", "internal_server_error",
+    "unsupported_parameter", "unknown_parameter", "invalid_parameter", "invalid_value",
+    "model_not_found", "invalid_json_schema",
+})
+
+
+def _error_label(value: Any) -> str | int | None:
+    # Error fields are untrusted too. Never persist arbitrary provider text,
+    # even when disguised as a short identifier rather than a message/body.
+    if value is None:
+        return None
+    if type(value) is int and 0 <= value <= 999999:
+        return value
+    if isinstance(value, str) and value in _ERROR_LABELS and not sanitize(value)[1]:
+        return value
+    return "unrecognized"
 
 
 def rate_headers(headers: Any) -> dict[str, str]:
@@ -39,7 +58,27 @@ def rate_headers(headers: Any) -> dict[str, str]:
               if str(key).lower() in _LIMIT_HEADERS}
     safe, changed = sanitize(values)
     # Never retain suspicious headers, even under an allowed header name.
-    return {} if changed else safe
+    if changed:
+        return {}
+    for key, value in safe.items():
+        if "reset" in key or key == "retry-after":
+            valid = len(value) <= 64 and _seconds(value) is not None
+            if not valid and key == "retry-after" and re.fullmatch(
+                r"(?:Mon|Tue|Wed|Thu|Fri|Sat|Sun), \d{2} "
+                r"(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec) "
+                r"\d{4} \d{2}:\d{2}:\d{2} GMT", value
+            ):
+                try:
+                    parsedate_to_datetime(value)
+                    valid = True
+                except (ValueError, TypeError, OverflowError):
+                    pass
+        else:
+            valid = re.fullmatch(r"[0-9]{1,20}", value) is not None
+        if not valid:
+            # Keep exhaustion checks fail-closed, without saving arbitrary text.
+            safe[key] = "[WITHHELD: invalid rate limit]"
+    return safe
 
 
 def _seconds(value: str) -> float | None:
@@ -81,8 +120,19 @@ def rate_blocked(limits: dict, required_tokens: int) -> bool:
         return True  # Uninterpretable provider limits are not permission to spend.
 
 
-def _provider_error(exc: Exception) -> tuple[str, dict]:
+def _provider_error(exc: Exception) -> tuple[str, dict, dict]:
     limits = rate_headers(exc.response.headers) if isinstance(exc, groq.APIStatusError) else {}
+    diagnostics = {}
+    if isinstance(exc, groq.APIStatusError):
+        body = exc.body if isinstance(exc.body, dict) else {}
+        error = body.get("error", body)
+        error = error if isinstance(error, dict) else {}
+        status = exc.status_code
+        diagnostics = {
+            "http_status": status if type(status) is int and 100 <= status <= 599 else None,
+            "provider_error_type": _error_label(error.get("type")),
+            "provider_error_code": _error_label(error.get("code")),
+        }
     if isinstance(exc, groq.AuthenticationError):
         category = "authentication"
     elif isinstance(exc, groq.PermissionDeniedError):
@@ -100,7 +150,7 @@ def _provider_error(exc: Exception) -> tuple[str, dict]:
         category = "provider_http_error"
     else:
         category = "unexpected_provider_error"
-    return category, limits
+    return category, limits, diagnostics
 
 
 def token_usage(completion: Any) -> dict | None:
@@ -183,12 +233,15 @@ class GroqReviewer:
             "chunk_count": 0, "error": "Review incomplete",
         }
         if recovery_id is not None:
-            recovery = self.store.executions.recovery(packet.task_id)
+            recovery = self.store.executions.recovery_by_id(packet.task_id, recovery_id)
             if (not recovery or recovery["recovery_id"] != recovery_id or recovery["stage"] != "claimed"
                     or recovery["commit_sha"] != packet.commit_sha or recovery["config"] != asdict(self.config)):
                 raise ReviewError("Review does not match the claimed recovery")
             record.update(recovery_id=recovery_id, original_review_id=recovery["original_review_id"],
                           recovery_timestamp=recovery["started_at"])
+            if recovery.get("compatibility_retry"):
+                record.update(recovery_attempt=2,
+                              previous_recovery_id=recovery["previous_recovery"]["recovery_id"])
         review_id = self.store.reviews.create(packet.task_id, packet.commit_sha, record)
         if recovery_id is not None:
             self.store.attach_recovery_review(packet.task_id, recovery_id, review_id)
@@ -280,8 +333,9 @@ class GroqReviewer:
                 error = str(exc)
                 request["error"] = error
             except Exception as exc:
-                category, limits = _provider_error(exc)
+                category, limits, diagnostics = _provider_error(exc)
                 request["rate_limits"] = limits or request["rate_limits"]
+                request.update(diagnostics)
                 request["error"] = error = category
             request["completed"] = True
             request["completed_at"] = utc_now()

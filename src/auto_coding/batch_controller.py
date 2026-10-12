@@ -26,7 +26,7 @@ from .workspace_lock import WorkspaceLockError
 logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from .review_recovery import RecoveryResult
+    from .review_recovery import CompatibilityRetry, RecoveryResult
 
 
 @dataclass(frozen=True)
@@ -84,10 +84,12 @@ class BatchController:
         self.review_config = review_config or ReviewConfig()
 
     def review_retry(self, batch_id: str, working_directory: str | Path, *,
-                     task_id: str, execute: bool = False) -> RecoveryResult:
+                     task_id: str, execute: bool = False,
+                     compatibility: CompatibilityRetry | None = None) -> RecoveryResult:
         """Explicit single-attempt recovery, never the ordinary execution loop."""
         from .review_recovery import ReviewRecovery
-        return ReviewRecovery(self).run(batch_id, working_directory, task_id=task_id, execute=execute)
+        return ReviewRecovery(self).run(batch_id, working_directory, task_id=task_id,
+                                       execute=execute, compatibility=compatibility)
 
     def run(self, batch_id: str, working_directory: str | Path, *, max_tasks: int | None = None) -> BatchResult:
         current = last = sha = decision = None

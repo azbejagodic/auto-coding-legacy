@@ -86,7 +86,7 @@ they cannot return an eligible approval.
 ### Review-only recovery
 
 The explicit [batch review-retry command](batch-execution.md#explicit-review-only-recovery-task-011-recovery)
-handles only recognized zero-request technical preparation failures, never a
+normally handles only recognized zero-request technical preparation failures, never a
 Groq rejection or substantive UNCERTAIN decision. It restores strictly validated
 controller-owned test checkpoints for the existing verified pushed commit; no
 Codex work, tests, implementation commit or push is repeated. Dry-run preflight
@@ -102,6 +102,11 @@ Only complete, identity-reverified approval allows the controller's atomic
 finalization; the reviewer alone still never changes task status.
 The model/effort remain `openai/gpt-oss-120b` / `medium`, with unchanged bounded
 SDK behavior and no automatic budget increase or provider fallback.
+One explicitly bound second technical attempt is available only for the exact
+historical unsupported-`store` HTTP failure; see the
+[strict exception and preflight](batch-execution.md#one-second-technical-recovery-for-the-unsupported-groq-parameter).
+It preserves both previous reviews and the first recovery audit, never permits
+a third attempt, and does not retry a substantive model judgment.
 
 ## Evidence and response validation
 
@@ -128,6 +133,11 @@ must match supplied criteria. Overall approval requires every criterion checked,
 all required chunks valid/approved, complete coverage and passing independent
 test/safety evidence. Durable task/commit state drift during review blocks
 approval. Groq cannot override failed tests or update the queue.
+
+Chat Completions arguments omit the unsupported `store` parameter entirely.
+The selected model, MEDIUM reasoning, strict structured output, bounded
+`max_completion_tokens`, non-streaming mode and `include_reasoning: false` remain
+unchanged. Omitting `store` is API compatibility, not a provider-retention promise.
 
 `eligible_to_proceed` expresses only eligibility for a future controller, not
 authorization to bypass its own tests, locks, state checks or Git safeguards.
@@ -276,6 +286,15 @@ transcripts, provider errors and token counts. SDK response text is retained
 when available, including malformed content, only after screening. Error payloads
 and raw exception messages are not logged/stored; static categories distinguish
 authentication, permission, timeout, network, rate limit, quota and HTTP failures.
+HTTP failures additionally retain a numeric `http_status` and sanitized
+`provider_error_type` / `provider_error_code` on the private request record.
+Only known safe labels (or bounded integer codes) are retained; arbitrary text
+becomes `unrecognized`, and absent fields stay null. Only existing allowlisted,
+screened rate-limit/Retry-After headers are retained. Unexpected header values
+are withheld with a static marker, so arbitrary echoed text is not saved and
+uninterpretable limit checks remain fail-closed. Raw error bodies/messages,
+other headers and sensitive request content are never copied into diagnostics
+or logs. Legacy HTTP records without status are not rewritten or guessed.
 Application logger messages contain model, request count, decision and sanitized
 errors, not prompts, keys or model content. Call the existing `configure_logging`
 explicitly if file logging is wanted; private transcripts stay in SQLite.

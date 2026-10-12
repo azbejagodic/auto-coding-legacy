@@ -337,7 +337,9 @@ def test_sdk_real_serialization_mock_transport_no_live_http(store, packet):
         assert body["model"] == "openai/gpt-oss-120b"
         assert body["reasoning_effort"] == "medium"
         assert body["response_format"]["json_schema"]["strict"] is True
-        assert body["store"] is False and body["include_reasoning"] is False
+        assert "store" not in body and body["include_reasoning"] is False
+        assert set(body) == {"model", "reasoning_effort", "messages", "response_format",
+                             "max_completion_tokens", "stream", "include_reasoning"}
         assert request.extensions["timeout"]["read"] == 45.0
         return httpx.Response(200, json=payload, headers={"x-ratelimit-remaining-requests": "42"})
 
@@ -362,6 +364,60 @@ def test_sdk_default_retries_overridden_on_error(store, packet):
         with groq.Groq(api_key="offline", http_client=http, max_retries=2) as client:
             result = GroqReviewer(store, client=client).review(packet)
     assert result.error == "quota_exhausted" and len(calls) == 1
+
+
+@pytest.mark.parametrize("status,label", [(400, "unsupported_parameter"), (422, "invalid_parameter"),
+                                          (500, "internal_server_error")])
+def test_http_error_diagnostics_use_real_sdk_offline(store, packet, status, label, caplog):
+    def handle(request):
+        assert "store" not in __import__("json").loads(request.content)
+        return httpx.Response(status, json={"error": {
+            "type": "invalid_request_error", "code": label,
+            "message": "PRIVATE PROMPT " + "gsk_" + "A" * 40,
+        }}, headers={"retry-after": "15", "Authorization": "private"})
+    with httpx.Client(transport=httpx.MockTransport(handle)) as http:
+        with groq.Groq(api_key="offline", http_client=http, max_retries=2) as client:
+            result = GroqReviewer(store, client=client).review(packet)
+    record = store.reviews.get(result.review_id)
+    request = record["requests"][0]
+    assert result.error == "provider_http_error" and not result.eligible_to_proceed
+    assert request["http_status"] == status and type(request["http_status"]) is int
+    assert request["provider_error_type"] == "invalid_request_error"
+    assert request["provider_error_code"] == label
+    assert request["rate_limits"] == {"retry-after": "15"}
+    assert record["api_requests"] == 1 and record["unknown_usage_requests"] == 1
+    assert "PRIVATE PROMPT" not in encoded(record) + caplog.text
+    assert "gsk_" not in encoded(record) + caplog.text
+    assert request["response"] is None and "response_text" not in request
+
+
+@pytest.mark.parametrize("value", ["gsk_" + "A" * 40, "PRIVATE_PROMPT", "short-unrecognized-value",
+                                   {"message": "private"}, ["private"], True])
+def test_untrusted_provider_error_labels_are_not_persisted(store, packet, value, caplog):
+    error = groq.BadRequestError("private body", response=httpx.Response(
+        400, request=httpx.Request("POST", "https://api.groq.com"),
+        headers={"x-ratelimit-remaining-tokens": "100", "retry-after": "gsk_" + "A" * 40},
+    ), body={"error": {"type": value, "code": value, "message": "private body"}})
+    result = GroqReviewer(store, client=client_for(error)).review(packet)
+    request = store.reviews.get(result.review_id)["requests"][0]
+    assert request["http_status"] == 400
+    assert request["provider_error_type"] == request["provider_error_code"] == "unrecognized"
+    assert request["rate_limits"] == {}
+    assert "private body" not in encoded(request) + caplog.text
+    assert "PRIVATE_PROMPT" not in encoded(request) + caplog.text
+
+
+def test_error_headers_cannot_echo_plaintext_prompts(store, packet, caplog):
+    error = groq.BadRequestError("PRIVATE PROMPT", response=httpx.Response(
+        400, request=httpx.Request("POST", "https://api.groq.com"),
+        headers={"retry-after": "PRIVATE PROMPT", "x-ratelimit-remaining-tokens": "PRIVATE PROMPT"},
+    ), body="PRIVATE PROMPT")
+    result = GroqReviewer(store, client=client_for(error)).review(packet)
+    request = store.reviews.get(result.review_id)["requests"][0]
+    assert request["http_status"] == 400
+    assert request["provider_error_type"] is None and request["provider_error_code"] is None
+    assert "PRIVATE PROMPT" not in encoded(request) + caplog.text
+    assert rate_blocked({**request["rate_limits"], "observed_at": datetime.now(timezone.utc).isoformat()}, 1)
 
 
 def test_all_acceptance_criteria_must_be_checked(store, packet):
