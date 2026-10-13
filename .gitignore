@@ -1,0 +1,71 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Build artifacts
+build/
+dist/
+
+# Application runtime data
+logs/
+*.log
+*.sqlite
+*.sqlite3
+*.db
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite3-journal
+*.sqlite3-wal
+*.sqlite3-shm
+*.db-journal
+*.db-wal
+*.db-shm
+runtime/
+.tmp/
+review-transcripts/
+review-history/
+
+# Local configuration and credentials
+config.toml
+*.secret
+.env
+.env.*
+!.env.example
+credentials/
+secrets/
+
+# Retained security exclusions for local profiles, credentials, and captures.
+# These protect existing private data even without a browser integration.
+browser-profile/
+browser_profiles/
+browser-profiles/
+chatgpt-profile/
+playwright-browsers/
+.auto-coding-operation.json
+storage-state*.json
+*.har
+*.trace.zip
+playwright/.auth/
+playwright-report/
+test-results/
+
+# IDE and OS files
+.idea/
+.vscode/
+*.code-workspace
+.DS_Store
+Thumbs.db
+
